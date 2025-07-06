@@ -6,7 +6,9 @@
   "directories": {
   },
   "dependencies": {
-    "tiktoken": "^1.0.17"
+    "openai": "^4.85.4",
+    "tiktoken": "^1.0.17",
+    "redis": "^4.7.0"
   },
   "devDependencies": {
     "chai": "^4.5.0",
