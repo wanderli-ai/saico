@@ -1,10 +1,6 @@
-````markdown
 # Saico - Simple AI-agent Conversation Orchestrator
 
-`Saico` is a minimal yet powerful JavaScript/Node.js library for managing AI conversations with hierarchical context,
-token-aware summarization, and fine-grained control over message flow. It’s designed to support complex nested 
-conversations while maintaining clean summaries and parent context, making it ideal for AI agents, assistants, and 
-customer support bots.
+`Saico` is a minimal yet powerful JavaScript/Node.js library for managing AI conversations with hierarchical context, token-aware summarization, and fine-grained control over message flow. It’s designed to support complex nested conversations while maintaining clean summaries and parent context, making it ideal for AI agents, assistants, and customer support bots.
 
 ---
 
