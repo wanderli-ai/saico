@@ -220,13 +220,13 @@ Pull requests, issues, and suggestions welcome! Please fork the repo and open a 
 This project was inspired by the need for a lightweight, non-opinionated alternative to LangChain’s memory modules, 
 with full support for real-world LLM conversation flows.
 
-```
 
 ---
+## 📣ToDo 
 
 Let me know if you'd like:
-- GitHub Actions CI badge
-- NPM publishing support
-- Docs site or typedoc config
-```
+- multi model support
+- language recognition
+- custom summary prompts
+- anything else
 
