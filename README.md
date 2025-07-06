@@ -1,7 +1,10 @@
 ````markdown
 # Saico - Simple AI-agent Conversation Orchestrator
 
-`Saico` is a minimal yet powerful JavaScript/Node.js library for managing AI conversations with hierarchical context, token-aware summarization, and fine-grained control over message flow. It’s designed to support complex nested conversations while maintaining clean summaries and parent context, making it ideal for AI agents, assistants, and customer support bots.
+`Saico` is a minimal yet powerful JavaScript/Node.js library for managing AI conversations with hierarchical context,
+token-aware summarization, and fine-grained control over message flow. It’s designed to support complex nested 
+conversations while maintaining clean summaries and parent context, making it ideal for AI agents, assistants, and 
+customer support bots.
 
 ---
 
@@ -19,14 +22,14 @@
 ## 📦 Installation
 
 ```bash
-npm install messages-ai-thread --save
+npm install saico-ai-thread --save
 ````
 
 Or clone manually:
 
 ```bash
-git clone https://github.com/yourusername/messages
-cd messages
+git clone https://github.com/wanderli-ai/saico
+cd saico
 ```
 
 ---
@@ -36,8 +39,8 @@ cd messages
 ### Basic Setup
 
 ```js
-const { createQ } = require('messages');
-const openai = require('./openai'); // must expose `send(msgs, functions?)`
+const { createQ } = require('saico');
+const openai = require('./openai');
 
 const q = createQ("You are a helpful assistant.", null, "main", 4000);
 
@@ -88,28 +91,106 @@ The conversation history is internally managed and can be accessed via:
 
 ## 🧪 Summary Behavior
 
-Summaries trigger when total token count exceeds 85% of the limit and are always triggered when `close()` is called. Summaries are:
+Summaries trigger when total token count exceeds 85% of the limit and are always triggered when `close()` is called.
+Summaries are:
 
 * Injected as special `[SUMMARY]: ...` messages
 * Bubbled up into the parent context
 * Excluded from re-summarization unless explicitly kept
 
+Here’s an updated `README.md` section to document the new Redis integration with observable storage:
+
+---
+
+## 🔄 Redis Integration (Persistent Observable State)
+
+This library includes an optional Redis-based persistence layer to automatically store and update conversation objects (or any JS object) using a **proxy-based observable**.
+
+It supports:
+
+* 🔄 **Auto-saving on change** (with debounce)
+* 🧠 **Selective serialization** (skips internal/private `_` properties)
+* 🗃️ **Support for serializing `Messages` class**
+* 🔍 **Efficient diff-checking** (saves only when changed)
+
+### 🔧 Setup
+
+1. Install `redis`:
+
+```bash
+npm install redis
+```
+
+2. Initialize Redis:
+
+```js
+const { init, createObservableForRedis } = require('./redis-store'); // adjust path if needed
+await init(); // connects to redis://localhost:6379
+```
+
+3. Wrap an object to persist changes:
+
+```js
+const { createQ } = require('./messages');
+const q = createQ("You're a travel assistant.", null, "flights", 3000);
+
+// Wrap with Redis observable
+const obsQ = createObservableForRedis("q:session:12345", q);
+```
+
+Now, any changes to `obsQ` (e.g., sending messages, updating properties) are **automatically saved** to Redis.
+
+### 💡 Use Case: Full User Context
+
+You can also persist a full user session context:
+
+```js
+const userContext = {
+  userId: 'abc123',
+  trip: {},
+  q: createQ("Trip assistant", null, "trip", 3000)
+};
+
+const observableUser = createObservableForRedis(`user:abc123`, userContext);
+```
+
+### 🔍 Inspecting Last Save
+
+You can retrieve the last save timestamp:
+
+```js
+console.log("Last Redis save:", observableUser.lastMod?.());
+```
+
+---
+
+## 🧼 Auto-Sanitization Rules
+
+When saving to Redis:
+
+* All keys starting with `_` are ignored.
+* Custom `.serialize()` methods (like on `Messages`) are respected.
+* Object updates are **debounced (1s)** and only saved if actual changes are detected.
+
+---
+
+## 🧪 Example Redis Dump (for a `Messages` instance)
+
+```json
+{
+  "0": { "role": "user", "content": "What’s my itinerary?" },
+  "1": { "role": "assistant", "content": "Here's your plan..." },
+  "lastSave": 1720371212345
+}
+```
 ---
 
 ## 🔌 OpenAI Integration
 
-This library expects an `openai.send(messages, functions)` method that:
+This library expects you to have openai credentials. Support for other model types will be added soon.
 
 * Accepts an array of messages in `{role, content}` format
 * Optionally supports function calling
-
-You must implement this externally. Example stub:
-
-```js
-async function send(messages, functions) {
-    return await openai.chat.completions.create({ messages, functions });
-}
-```
 
 ---
 
@@ -117,9 +198,10 @@ async function send(messages, functions) {
 
 ```
 .
-├── messages.js         # Core implementation
-├── openai.js           # Your own wrapper for OpenAI (or any LLM)
-├── util.js             # Utilities: token counting, logging, etc.
+├── saico.js         # Core implementation
+├── openai.js        # Openai api wrapper
+├── redis.js         # Saico compatible redis wrapper
+├── util.js          # Utilities: token counting, etc.
 └── README.md
 ```
 
@@ -127,7 +209,7 @@ async function send(messages, functions) {
 
 ## 🔐 License
 
-MIT License © \[Your Name or Org]
+MIT License © \[Wanderli.ai]
 
 ---
 
@@ -139,14 +221,14 @@ Pull requests, issues, and suggestions welcome! Please fork the repo and open a 
 
 ## 📣 Acknowledgements
 
-This project was inspired by the need for a lightweight, non-opinionated alternative to LangChain’s memory modules, with full support for real-world LLM conversation flows.
+This project was inspired by the need for a lightweight, non-opinionated alternative to LangChain’s memory modules, 
+with full support for real-world LLM conversation flows.
 
 ```
 
 ---
 
 Let me know if you'd like:
-- a sample `openai.js`
 - GitHub Actions CI badge
 - NPM publishing support
 - Docs site or typedoc config
