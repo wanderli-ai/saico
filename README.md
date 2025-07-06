@@ -127,7 +127,7 @@ await init(); // connects to redis://localhost:6379
 3. Wrap an object to persist changes:
 
 ```js
-const { createQ } = require('./messages');
+const { createQ } = require('./saico');
 const q = createQ("You're a travel assistant.", null, "flights", 3000);
 
 // Wrap with Redis observable
