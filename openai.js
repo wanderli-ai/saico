@@ -11,11 +11,29 @@ module.exports = {
 async function send(messages, functions, model) {
 	let data;
 	let retries = 5;
+	
+	// Convert functions to tools format if provided
+	let tools;
+	if (functions && functions.length > 0) {
+		tools = functions.map(func => ({
+			type: 'function',
+			function: func
+		}));
+	}
+	
 	while (--retries)
 	{
 		try {
-			data = await openai.chat.completions.create({
-				model: model || 'gpt-4o', messages, functions, });
+			const requestParams = {
+				model: model || 'gpt-5-mini',
+				messages
+			};
+			
+			if (tools) {
+				requestParams.tools = tools;
+			}
+			
+			data = await openai.chat.completions.create(requestParams);
 			break;
 		} catch (error) {
 			// Check if the status code is 429

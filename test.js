@@ -23,7 +23,7 @@ describe('Messages', function () {
         });
         sandbox.stub(openai, 'send').resolves({ content: 'summary content' });
         sandbox.stub(crypto, 'randomBytes').returns(Buffer.from('abcd', 'hex'));
-        messages = saico.createQ(fakePrompt, {tag: 'test', token_limit: fakeTokenLimit});
+        messages = saico.createQ(fakePrompt, null, 'test', fakeTokenLimit);
     });
 
     afterEach(() => {
@@ -147,12 +147,12 @@ describe('Messages', function () {
             });
 
         it('should include parent context if parent exists', () => {
-            const parent = saico.createQ('Parent prompt', {tag: 'parent'});
+            const parent = saico.createQ('Parent prompt', null, 'parent');
             parent.pushSummary('parent summary');
-            parent.spawnChild(fakePrompt, {tag: 'child'});
+            const child = parent.spawnChild(fakePrompt, 'child');
 
-            parent.child.pushSummary('child summary');
-            const context = parent.child.getMsgContext();
+            child.pushSummary('child summary');
+            const context = child.getMsgContext();
 
             expect(context).to.deep.equal([
                 { role: 'system', content: 'Parent prompt' },
@@ -183,7 +183,9 @@ describe('Messages', function () {
         it('should call _summarizeContext with true', async () => {
             const spy = sandbox.spy(messages, '_summarizeContext');
             await messages.close();
-            sinon.assert.calledWith(spy, true);
+            // Use setTimeout to allow setImmediate to execute
+            await new Promise(resolve => setTimeout(resolve, 10));
+            sinon.assert.calledWith(spy, true, null);
         });
     });
 
@@ -200,9 +202,9 @@ describe('Messages', function () {
             });
 
         it('should include parent context in openai.send', async () => {
-            const parent = saico.createQ('Parent prompt', {tag: 'parent'});
+            const parent = saico.createQ('Parent prompt', null, 'parent');
             parent.pushSummary('parent summary');
-            messages = saico.createQ(fakePrompt, {tag: 'child'}, null, parent);
+            messages = saico.createQ(fakePrompt, parent, 'child');
 
             messages.pushSummary('child summary');
             await messages.sendMessage('user', 'Hi', null, {});
@@ -223,11 +225,11 @@ describe('Messages', function () {
         });
     });
 
-    describe('_sendMessageInternal', () => {
+    describe('_processSendMessage', () => {
         it('should call openai.send with full context including parent and summaries', async () => {
-            const parent = saico.createQ('Parent prompt', {tag: 'parent'});
+            const parent = saico.createQ('Parent prompt', null, 'parent');
             parent.pushSummary('parent summary');
-            messages = parent.spawnChild(fakePrompt, {tag: 'child'});
+            messages = parent.spawnChild(fakePrompt, 'child');
             messages.pushSummary('child summary');
 
             const o = {
@@ -238,7 +240,7 @@ describe('Messages', function () {
                 replied: 0
             };
 
-            const reply = await messages._sendMessageInternal(o);
+            const reply = await messages._processSendMessage(o, 1);
             expect(reply).to.have.property('content', 'summary content');
 
             const sentArgs = openai.send.getCall(0).args[0];
@@ -250,8 +252,8 @@ describe('Messages', function () {
             ]);
         });
 
-        it('should remove function_call if nofunc is set', async () => {
-            openai.send.resolves({ content: 'reply', function_call: { name: 'test' } });
+        it('should remove tool_calls if nofunc is set', async () => {
+            openai.send.resolves({ content: 'reply', tool_calls: [{ id: 'test', function: { name: 'test', arguments: '{}' } }] });
 
             const o = {
                 msg: { role: 'user', content: 'Hi' },
@@ -261,8 +263,8 @@ describe('Messages', function () {
                 replied: 0
             };
 
-            const reply = await messages._sendMessageInternal(o);
-            expect(reply.function_call).to.be.undefined;
+            const reply = await messages._processSendMessage(o, 1);
+            expect(reply.tool_calls).to.be.undefined;
         });
     });
 
@@ -286,6 +288,197 @@ describe('Messages', function () {
             messages.push({ role: 'user', content: 'Hello' });
             const keys = Object.keys(messages);
             expect(keys).to.include('0');
+        });
+    });
+
+    describe('Tool Calls Functionality', () => {
+        let mockToolHandler;
+        
+        beforeEach(() => {
+            mockToolHandler = sandbox.stub().resolves('tool result');
+            messages = saico.createQ(fakePrompt, null, 'test', fakeTokenLimit, null, mockToolHandler);
+        });
+        
+        it('should handle basic tool calls', async () => {
+            const mockReply = {
+                content: 'I will help you',
+                tool_calls: [{
+                    id: 'call_123',
+                    type: 'function',
+                    function: {
+                        name: 'test_tool',
+                        arguments: JSON.stringify({ param: 'value' })
+                    }
+                }]
+            };
+            
+            openai.send.onFirstCall().resolves(mockReply);
+            openai.send.onSecondCall().resolves({ content: 'Done!' });
+            
+            const reply = await messages.sendMessage('user', 'Test message', null, {});
+            
+            expect(mockToolHandler.calledOnce).to.be.true;
+            expect(mockToolHandler.firstCall.args[0]).to.equal('test_tool');
+            expect(reply.content).to.include('I will help you');
+        });
+        
+        it('should track tool call sequences and prevent excessive repetition', () => {
+            messages._trackToolCall('test_tool');
+            messages._trackToolCall('test_tool');
+            messages._trackToolCall('test_tool');
+            
+            expect(messages._tool_call_sequence).to.deep.equal(['test_tool', 'test_tool', 'test_tool']);
+            
+            // Fill up to max repetition
+            for (let i = 0; i < messages.max_tool_repetition - 3; i++) {
+                messages._trackToolCall('test_tool');
+            }
+            
+            expect(messages._shouldDropToolCall('test_tool')).to.be.true;
+        });
+        
+        it('should reset tool sequence for different tools', () => {
+            messages._trackToolCall('tool_a');
+            messages._trackToolCall('tool_a');
+            
+            messages._resetToolSequenceIfDifferent(['tool_b']);
+            
+            expect(messages._tool_call_sequence).to.deep.equal([]);
+        });
+        
+        it('should filter excessive tool calls', () => {
+            // Fill up tool call sequence to max
+            for (let i = 0; i < messages.max_tool_repetition; i++) {
+                messages._trackToolCall('test_tool');
+            }
+            
+            const toolCalls = [{
+                id: 'call_123',
+                function: { name: 'test_tool', arguments: '{}' }
+            }];
+            
+            const filtered = messages._filterExcessiveToolCalls(toolCalls);
+            expect(filtered).to.have.length(0);
+        });
+        
+        it('should detect duplicate tool calls', () => {
+            const call1 = {
+                id: 'call_1',
+                function: { name: 'test_tool', arguments: '{"param": "value"}' }
+            };
+            
+            const call2 = {
+                id: 'call_2', 
+                function: { name: 'test_tool', arguments: '{"param": "value"}' }
+            };
+            
+            messages._trackActiveToolCall(call1);
+            
+            expect(messages._isDuplicateToolCall(call2)).to.be.true;
+            expect(messages._isDuplicateToolCall({ 
+                id: 'call_3',
+                function: { name: 'test_tool', arguments: '{"param": "different"}' }
+            })).to.be.false;
+        });
+        
+        it('should defer tool calls when max depth is reached', async () => {
+            messages.max_depth = 2;
+            
+            const mockReply = {
+                content: 'Tool calls needed',
+                tool_calls: [{
+                    id: 'call_123',
+                    type: 'function', 
+                    function: {
+                        name: 'test_tool',
+                        arguments: '{}'
+                    }
+                }]
+            };
+            
+            openai.send.resolves(mockReply);
+            
+            const o = messages._createMsgObj('user', 'Test', null, {});
+            await messages._processSendMessage(o, 3); // Depth > max_depth
+            
+            expect(messages._deferred_tool_calls).to.have.length(1);
+            expect(messages._deferred_tool_calls[0].call.id).to.equal('call_123');
+        });
+        
+        it('should handle pending tool calls and queue messages', async () => {
+            // Create a message with tool calls but don't provide tool responses
+            const toolCallMsg = {
+                msg: {
+                    role: 'assistant',
+                    content: 'I need to call a tool',
+                    tool_calls: [{
+                        id: 'call_123',
+                        type: 'function',
+                        function: { name: 'test_tool', arguments: '{}' }
+                    }]
+                },
+                msgid: 'test_msg',
+                opts: {},
+                replied: 3
+            };
+            
+            messages._msgs.push(toolCallMsg);
+            
+            expect(messages._hasPendingToolCalls()).to.be.true;
+            
+            const result = await messages.sendMessage('user', 'Another message', null, {});
+            expect(result.queued).to.be.true;
+            expect(messages._waitingQueue).to.have.length(1);
+        });
+        
+        it('should process waiting queue when tool calls complete', () => {
+            messages._waitingQueue.push(
+                { role: 'user', content: 'Message 1', functions: null, opts: {} },
+                { role: 'user', content: 'Message 2', functions: null, opts: {} }
+            );
+            
+            const originalLength = messages._msgs.length;
+            messages._processWaitingQueue();
+            
+            expect(messages._waitingQueue).to.have.length(0);
+            expect(messages._msgs.length).to.equal(originalLength + 2);
+        });
+        
+        it('should handle tool call timeouts', async () => {
+            const slowHandler = sandbox.stub().returns(new Promise(resolve => {
+                setTimeout(() => resolve('slow result'), 6000); // 6 seconds, longer than default timeout
+            }));
+            
+            const call = {
+                id: 'call_123',
+                function: { name: 'slow_tool', arguments: '{}' }
+            };
+            
+            const result = await messages._executeToolCallWithTimeout(call, slowHandler, 1000);
+            expect(result).to.include('timed out');
+        });
+        
+        it('should move unresponded tool calls from parent to child', () => {
+            const parent = saico.createQ('Parent', null, 'parent');
+            
+            // Add a tool call message to parent without response
+            parent._msgs.push({
+                msg: {
+                    role: 'assistant',
+                    content: 'Calling tool',
+                    tool_calls: [{ id: 'call_123', function: { name: 'test', arguments: '{}' } }]
+                },
+                msgid: 'parent_msg',
+                opts: {},
+                replied: 3
+            });
+            
+            const child = parent.spawnChild('Child', 'child');
+            
+            // Tool call should be moved to child
+            expect(child._msgs).to.have.length(1);
+            expect(child._msgs[0].msg.tool_calls).to.exist;
+            expect(parent._msgs).to.have.length(0); // Should be moved out of parent
         });
     });
 });
