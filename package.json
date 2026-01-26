@@ -1,8 +1,9 @@
 {
-  "name": "wanderli",
-  "version": "1.0.0",
-  "main": "server.js",
+  "name": "saico",
+  "version": "2.0.0",
+  "main": "index.js",
   "type": "commonjs",
+  "description": "Hierarchical AI Conversation Orchestrator - Task hierarchy with conversation contexts",
   "directories": {
   },
   "dependencies": {
@@ -14,14 +15,15 @@
     "chai": "^4.5.0",
     "chai-http": "^4.4.0",
     "mock-fs": "^5.4.1",
+    "mocha": "^10.2.0",
+    "sinon": "^17.0.0",
     "sinon-chai": "^3.7.0"
   },
   "scripts": {
-    "test": "mocha --exit 'test.js'",
+    "test": "NODE_ENV=test mocha --exit 'test/**/*.test.js'",
     "start": "node server.js"
   },
-  "keywords": [],
+  "keywords": ["ai", "conversation", "orchestrator", "task", "hierarchy", "openai"],
   "author": "",
-  "license": "ISC",
-  "description": ""
+  "license": "ISC"
 }
