@@ -4,7 +4,27 @@
   "main": "index.js",
   "type": "commonjs",
   "description": "Hierarchical AI Conversation Orchestrator - Task hierarchy with conversation contexts",
-  "directories": {
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wanderli-ai/saico.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wanderli-ai/saico/issues"
+  },
+  "homepage": "https://github.com/wanderli-ai/saico#readme",
+  "files": [
+    "index.js",
+    "itask.js",
+    "context.js",
+    "sid.js",
+    "openai.js",
+    "util.js",
+    "redis.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16.0.0"
   },
   "dependencies": {
     "openai": "^4.85.4",
@@ -23,7 +43,7 @@
     "test": "NODE_ENV=test mocha --exit 'test/**/*.test.js'",
     "start": "node server.js"
   },
-  "keywords": ["ai", "conversation", "orchestrator", "task", "hierarchy", "openai"],
-  "author": "",
+  "keywords": ["ai", "conversation", "orchestrator", "task", "hierarchy", "openai", "chatgpt", "llm"],
+  "author": "wanderli-ai",
   "license": "ISC"
 }
