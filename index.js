@@ -9,19 +9,43 @@
  * - Optional conversation contexts attached to tasks
  * - Hierarchical message aggregation with function collection
  * - Full tool_calls support with depth control
+ * - Storage persistence (Redis cache + optional DB backend)
  *
  * Main Components:
  * - Itask: Base task class for all tasks (supports states, cancellation, promises)
  * - Context: Conversation context with message handling and tool calls
  * - Sid: Session root task (extends Itask, always has a context)
+ * - Store: Storage abstraction layer (Redis + optional backends like DynamoDB)
  */
 
 const Itask = require('./itask.js');
 const { Context, createContext } = require('./context.js');
 const { Sid, createSid } = require('./sid.js');
+const { Store, DynamoBackend } = require('./store.js');
 
 // Wire up Context class reference in Itask to avoid circular dependency
 Itask.Context = Context;
+
+/**
+ * Initialize Saico with storage configuration.
+ * Sets up the Store singleton and optionally initializes Redis.
+ *
+ * @param {Object} config - Configuration options
+ * @param {boolean} config.redis - Whether to initialize Redis
+ * @param {Object} config.dynamodb - DynamoDB backend config {table, aws}
+ * @returns {Store} The initialized Store instance
+ */
+async function init(config = {}) {
+    const store = Store.init(config);
+
+    if (config.redis) {
+        const redis = require('./redis.js');
+        await redis.init();
+        store.setRedis(redis.rclient);
+    }
+
+    return store;
+}
 
 /**
  * Create a new task with optional context.
@@ -35,12 +59,16 @@ Itask.Context = Context;
  * @param {Object} opt.bind - Bind context for state functions
  * @param {Itask} opt.spawn_parent - Parent task to spawn under
  * @param {boolean} opt.async - If true, don't auto-run
+ * @param {Object} opt.store - Store instance for persistence
  * @param {Array} states - Array of state functions
  * @returns {Itask} The created task
  */
 function createTask(opt, states = []) {
     if (typeof opt === 'string')
         opt = { name: opt };
+
+    if (!opt.store)
+        opt.store = Store.instance;
 
     const task = new Itask(opt, states);
 
@@ -95,7 +123,8 @@ function createQ(prompt, parent, tag, token_limit, msgs, tool_handler, config = 
         const childTask = new Itask({
             name: tag || 'child-context',
             async: true,
-            spawn_parent: parent.task
+            spawn_parent: parent.task,
+            store: Store.instance
         }, []);
         context.setTask(childTask);
         childTask.setContext(context);
@@ -110,6 +139,11 @@ module.exports = {
     Itask,
     Context,
     Sid,
+    Store,
+    DynamoBackend,
+
+    // Initialization
+    init,
 
     // Factory functions
     createTask,

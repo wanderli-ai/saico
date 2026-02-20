@@ -5,7 +5,7 @@ const sinon = require('sinon');
 const expect = chai.expect;
 
 const saico = require('../index.js');
-const { Itask, Context, Sid, createTask, createSid, createContext, createQ } = saico;
+const { Itask, Context, Sid, Store, createTask, createSid, createContext, createQ } = saico;
 const openai = require('../openai.js');
 const util = require('../util.js');
 
@@ -24,11 +24,13 @@ describe('Integration Tests', function () {
         sandbox.stub(openai, 'send').resolves({ content: 'AI response' });
         mockToolHandler = sandbox.stub().resolves({ content: 'tool result', functions: null });
         Itask.root.clear();
+        Store.instance = null;
     });
 
     afterEach(() => {
         sandbox.restore();
         Itask.root.clear();
+        Store.instance = null;
     });
 
     describe('Module exports', () => {
@@ -36,6 +38,11 @@ describe('Integration Tests', function () {
             expect(Itask).to.be.a('function');
             expect(Context).to.be.a('function');
             expect(Sid).to.be.a('function');
+            expect(Store).to.be.a('function');
+        });
+
+        it('should export init function', () => {
+            expect(saico.init).to.be.a('function');
         });
 
         it('should export factory functions', () => {
@@ -74,7 +81,7 @@ describe('Integration Tests', function () {
             }, []);
 
             // Send message from child - should include parent context
-            await childTask.sendMessage('user', 'Working on subtask');
+            await childTask.sendMessage('Working on subtask');
 
             const sentArgs = openai.send.getCall(0).args[0];
 
@@ -82,7 +89,7 @@ describe('Integration Tests', function () {
             expect(sentArgs[0]).to.deep.equal({ role: 'system', content: 'You are a helpful assistant.' });
             expect(sentArgs.some(m => m.content?.includes('Previous conversation summary'))).to.be.true;
             expect(sentArgs.some(m => m.content === 'You are handling a specific subtask.')).to.be.true;
-            expect(sentArgs.some(m => m.content === 'Working on subtask')).to.be.true;
+            expect(sentArgs.some(m => m.content === '[BACKEND] Working on subtask')).to.be.true;
         });
 
         it('should aggregate functions from hierarchy', async () => {
@@ -101,7 +108,7 @@ describe('Integration Tests', function () {
                 functions: [childFunc]
             }, []);
 
-            await childTask.sendMessage('user', 'Test message');
+            await childTask.sendMessage('Test message');
 
             const sentFunctions = openai.send.getCall(0).args[1];
             expect(sentFunctions).to.exist;
@@ -130,7 +137,7 @@ describe('Integration Tests', function () {
             const level2Ctx = new Context('Level 2', level2Task, {});
             level2Task.setContext(level2Ctx);
 
-            await level2Task.sendMessage('user', 'Deep message');
+            await level2Task.sendMessage('Deep message');
 
             const sentArgs = openai.send.getCall(0).args[0];
 
@@ -154,8 +161,8 @@ describe('Integration Tests', function () {
                 name: 'simple'
             }, [
                 async function() {
-                    // This should use the session's context
-                    return await this.sendMessage('user', 'Simple task message');
+                    // This should use the session's context (with [BACKEND] prefix)
+                    return await this.sendMessage('Simple task message');
                 }
             ]);
 
@@ -190,7 +197,7 @@ describe('Integration Tests', function () {
             openai.send.onFirstCall().resolves(toolCallReply);
             openai.send.onSecondCall().resolves({ content: 'Tool processed' });
 
-            const reply = await session.sendMessage('user', 'Use a tool');
+            const reply = await session.sendMessage('Use a tool');
 
             expect(mockToolHandler.calledOnce).to.be.true;
             expect(reply.content).to.include('Calling tool');
@@ -224,7 +231,7 @@ describe('Integration Tests', function () {
             openai.send.onFirstCall().resolves(toolCallReply);
             openai.send.onSecondCall().resolves({ content: 'Done' });
 
-            await child.sendMessage('user', 'Use tool from child');
+            await child.sendMessage('Use tool from child');
 
             expect(mockToolHandler.calledOnce).to.be.true;
         });
@@ -344,11 +351,11 @@ describe('Integration Tests', function () {
 
             openai.send.resolves({ content: 'Response' });
 
-            // Send multiple messages concurrently
+            // Send multiple messages concurrently (new signature: content, functions, opts)
             const promises = [
-                session.sendMessage('user', 'Message 1'),
-                session.sendMessage('user', 'Message 2'),
-                session.sendMessage('user', 'Message 3')
+                session.sendMessage('Message 1'),
+                session.sendMessage('Message 2'),
+                session.sendMessage('Message 3')
             ];
 
             const results = await Promise.all(promises);
@@ -394,7 +401,23 @@ describe('Integration Tests', function () {
             openai.send.rejects(new Error('API Error'));
 
             try {
-                await session.sendMessage('user', 'Hello');
+                await session.sendMessage('Hello');
+                expect.fail('Should have thrown');
+            } catch (err) {
+                expect(err.message).to.equal('API Error');
+            }
+        });
+
+        it('should handle sendMessage errors gracefully with new signature', async () => {
+            const session = createSid({
+                name: 'session',
+                prompt: 'Session prompt'
+            });
+
+            openai.send.rejects(new Error('API Error'));
+
+            try {
+                await session.recvChatMessage('Hello');
                 expect.fail('Should have thrown');
             } catch (err) {
                 expect(err.message).to.equal('API Error');
@@ -422,10 +445,178 @@ describe('Integration Tests', function () {
             openai.send.onFirstCall().resolves(toolCallReply);
             openai.send.onSecondCall().resolves({ content: 'Handled error' });
 
-            const reply = await session.sendMessage('user', 'Use failing tool');
+            const reply = await session.sendMessage('Use failing tool');
 
             // Should have continued with error message
             expect(reply).to.exist;
+        });
+    });
+
+    describe('Context ID and Message Tagging', () => {
+        it('should generate context_id for tasks with contexts', () => {
+            const session = createSid({
+                name: 'session',
+                prompt: 'Session prompt'
+            });
+
+            expect(session.context_id).to.be.a('string');
+            expect(session.context_id.length).to.be.greaterThan(0);
+            expect(session.context.tag).to.equal(session.context_id);
+        });
+
+        it('should generate context_id for child tasks', () => {
+            const session = createSid({
+                name: 'session',
+                prompt: 'Session prompt'
+            });
+
+            const child = session.spawnTaskWithContext({
+                name: 'child',
+                prompt: 'Child prompt'
+            }, []);
+
+            expect(child.context_id).to.be.a('string');
+            expect(child.context_id).to.not.equal(session.context_id);
+        });
+
+        it('should tag messages with context_id via sendMessage', async () => {
+            const session = createSid({
+                name: 'session',
+                prompt: 'Session prompt'
+            });
+
+            await session.sendMessage('Backend instruction');
+
+            const backendMsg = session.context._msgs.find(m =>
+                m.msg.content === '[BACKEND] Backend instruction');
+            expect(backendMsg).to.exist;
+            expect(backendMsg.opts.tag).to.equal(session.context_id);
+        });
+
+        it('should tag messages with context_id via recvChatMessage', async () => {
+            const session = createSid({
+                name: 'session',
+                prompt: 'Session prompt'
+            });
+
+            await session.recvChatMessage('User chat message');
+
+            const chatMsg = session.context._msgs.find(m =>
+                m.msg.content === 'User chat message');
+            expect(chatMsg).to.exist;
+            expect(chatMsg.opts.tag).to.equal(session.context_id);
+        });
+    });
+
+    describe('Context cleanToolCallsByTag', () => {
+        it('should remove tool-related messages by tag', () => {
+            const ctx = createContext('Test prompt', null, {});
+            const testTag = 'test-tag-123';
+
+            // Add some regular messages
+            ctx._msgs.push({
+                msg: { role: 'user', content: 'Hello' },
+                opts: { tag: testTag },
+                msgid: 'msg1',
+                replied: 1
+            });
+
+            // Add tool call message
+            ctx._msgs.push({
+                msg: {
+                    role: 'assistant',
+                    content: 'Calling tool',
+                    tool_calls: [{ id: 'tc1', function: { name: 'test', arguments: '{}' } }]
+                },
+                opts: { tag: testTag },
+                msgid: 'msg2',
+                replied: 3
+            });
+
+            // Add tool response
+            ctx._msgs.push({
+                msg: { role: 'tool', content: 'result', tool_call_id: 'tc1' },
+                opts: { tag: testTag },
+                msgid: 'msg3',
+                replied: 1
+            });
+
+            // Add message with different tag
+            ctx._msgs.push({
+                msg: { role: 'user', content: 'Other message' },
+                opts: { tag: 'other-tag' },
+                msgid: 'msg4',
+                replied: 1
+            });
+
+            ctx.cleanToolCallsByTag(testTag);
+
+            expect(ctx._msgs).to.have.length(2);
+            expect(ctx._msgs[0].msg.content).to.equal('Hello');
+            expect(ctx._msgs[1].msg.content).to.equal('Other message');
+        });
+    });
+
+    describe('Context loadHistory', () => {
+        it('should load and insert chat history after system messages', async () => {
+            const mockStore = {
+                load: sinon.stub().resolves({
+                    chat_history: JSON.stringify([
+                        { role: 'user', content: 'Previous question' },
+                        { role: 'assistant', content: 'Previous answer' }
+                    ])
+                })
+            };
+
+            const ctx = createContext('System prompt', null, { tag: 'test-tag' });
+
+            await ctx.loadHistory(mockStore);
+
+            expect(ctx._msgs).to.have.length(2);
+            expect(ctx._msgs[0].msg.content).to.equal('Previous question');
+            expect(ctx._msgs[1].msg.content).to.equal('Previous answer');
+        });
+
+        it('should handle compressed chat history', async () => {
+            const messages = [
+                { role: 'user', content: 'Compressed question' },
+                { role: 'assistant', content: 'Compressed answer' }
+            ];
+            const compressed = await util.compressMessages(messages);
+
+            const mockStore = {
+                load: sinon.stub().resolves({ chat_history: compressed })
+            };
+
+            const ctx = createContext('System prompt', null, { tag: 'test-tag' });
+            await ctx.loadHistory(mockStore);
+
+            expect(ctx._msgs).to.have.length(2);
+            expect(ctx._msgs[0].msg.content).to.equal('Compressed question');
+        });
+    });
+
+    describe('Full Persistence Flow', () => {
+        it('should create session, send messages, close, and verify chat_history', async () => {
+            const session = createSid({
+                name: 'persist-session',
+                prompt: 'Session prompt'
+            });
+
+            // Send backend message
+            await session.sendMessage('Check booking');
+
+            // Send user chat message
+            await session.recvChatMessage('I want to book a hotel');
+
+            // Verify both types are in the context
+            const backendMsg = session.context._msgs.find(m =>
+                m.msg.content === '[BACKEND] Check booking');
+            expect(backendMsg).to.exist;
+
+            const chatMsg = session.context._msgs.find(m =>
+                m.msg.content === 'I want to book a hotel');
+            expect(chatMsg).to.exist;
         });
     });
 });

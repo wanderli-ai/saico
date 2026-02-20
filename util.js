@@ -1,5 +1,9 @@
 const is_mocha = process.env.NODE_ENV == 'test';
 const tiktoken = require('tiktoken');
+const zlib = require('zlib');
+const { promisify } = require('util');
+const gzip = promisify(zlib.gzip);
+const gunzip = promisify(zlib.gunzip);
 
 const debug = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
 
@@ -58,6 +62,8 @@ const lerr = _lerr;
 
 module.exports = {
     countTokens,
+    compressMessages,
+    decompressMessages,
     is_mocha,
     _log,
     _lerr,
@@ -68,6 +74,34 @@ module.exports = {
     shallowEqual,
     filterArray,
     logEvent,
+}
+
+async function compressMessages(messages) {
+    const json = JSON.stringify(messages);
+    const compressed = await gzip(Buffer.from(json, 'utf8'));
+    return compressed.toString('base64');
+}
+
+async function decompressMessages(data) {
+    if (Array.isArray(data))
+        return data;
+    if (typeof data === 'string') {
+        // Try JSON parse first (plain JSON string)
+        try {
+            const parsed = JSON.parse(data);
+            if (Array.isArray(parsed))
+                return parsed;
+        } catch (e) { /* not plain JSON, try base64/gzip */ }
+        // Try base64 gzip
+        try {
+            const buf = Buffer.from(data, 'base64');
+            const decompressed = await gunzip(buf);
+            return JSON.parse(decompressed.toString('utf8'));
+        } catch (e) {
+            throw new Error('decompressMessages: unable to decompress data: ' + e.message);
+        }
+    }
+    throw new Error('decompressMessages: unsupported data type: ' + typeof data);
 }
 
 function countTokens(messages, model = "gpt-4o") {

@@ -34,6 +34,9 @@ class Context {
         this._deferred_tool_calls = [];
         this._tool_call_sequence = [];
 
+        // Chat history persistence
+        this.chat_history = config.chat_history || null;
+
         this._msgs = [];
         this._waitingQueue = [];
         this._active_tool_calls = new Map();
@@ -395,6 +398,44 @@ class Context {
 
         await this._summarizeContext(true, parentCtx);
         _log('Finished closing Context tag', this.tag);
+    }
+
+    // Load chat history from store into message queue
+    async loadHistory(store) {
+        if (!store || !this.tag)
+            return;
+        const data = await store.load(this.tag);
+        if (!data || !data.chat_history)
+            return;
+        const messages = await util.decompressMessages(data.chat_history);
+        if (!Array.isArray(messages) || messages.length === 0)
+            return;
+        // Find the index after the last system message to insert history
+        let insertIdx = 0;
+        for (let i = 0; i < this._msgs.length; i++) {
+            if (this._msgs[i].msg.role === 'system')
+                insertIdx = i + 1;
+        }
+        const historyMsgs = messages.map(m => ({
+            msg: m,
+            opts: {},
+            msgid: crypto.randomBytes(2).toString('hex'),
+            replied: 1
+        }));
+        this._msgs.splice(insertIdx, 0, ...historyMsgs);
+    }
+
+    // Remove tool-related messages tagged with a specific tag
+    cleanToolCallsByTag(tag) {
+        this._msgs = this._msgs.filter(m => {
+            if (m.opts.tag !== tag)
+                return true;
+            if (m.msg.tool_calls)
+                return false;
+            if (m.msg.role === 'tool')
+                return false;
+            return true;
+        });
     }
 
     async _summarizeContext(close, targetCtx) {
@@ -971,7 +1012,10 @@ class Context {
         if (content && typeof content !== 'string')
             content = JSON.stringify(content);
         else if (!content)
-            content = `tool call ${call.function.name} ${call.id} completed. do not reply. wait for the next msg from the user`;
+        {
+            content = `tool call ${call.function.name} ${call.id} completed. do not reply. wait for the next msg `
+                +`from the user`;
+        }
 
         _log('FUNCTION RESULT', call.function.name, call.id, content.substring(0, 50) + '...',
             functions ? 'with functions' : 'no functions');

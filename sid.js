@@ -2,6 +2,7 @@
 
 const Itask = require('./itask.js');
 const { Context, createContext } = require('./context.js');
+const { Store } = require('./store.js');
 
 /**
  * Sid - Session/User Context root task.
@@ -25,6 +26,7 @@ class Sid extends Itask {
             ...opt,
             name,
             prompt,
+            store: opt.store || Store.instance || null,
             async: true // We'll manage running ourselves
         }, states);
 
@@ -39,16 +41,23 @@ class Sid extends Itask {
             ...opt.sessionConfig
         };
 
+        // Generate context_id if not already set by parent constructor
+        if (!this.context_id) {
+            const store = this._store || Store.instance;
+            this.context_id = store ? store.generateId() : require('crypto').randomBytes(8).toString('hex');
+        }
+
         // Always create a context for Sid (root session task)
         const contextConfig = {
-            tag: opt.tag || this.id,
+            tag: this.context_id,
             token_limit: this.sessionConfig.token_limit,
             max_depth: this.sessionConfig.max_depth,
             max_tool_repetition: this.sessionConfig.max_tool_repetition,
             tool_handler: opt.tool_handler,
             functions: opt.functions,
             sequential_mode: opt.sequential_mode,
-            msgs: opt.msgs
+            msgs: opt.msgs,
+            chat_history: opt.chat_history
         };
 
         this.context = new Context(prompt, this, contextConfig);
@@ -61,9 +70,17 @@ class Sid extends Itask {
         }
     }
 
-    // Override sendMessage to always use our context
-    async sendMessage(role, content, functions, opts) {
-        return this.context.sendMessage(role, content, functions || this.functions, opts);
+    // Override sendMessage — new signature: sendMessage(content, functions, opts)
+    // Always sends as role='user' with '[BACKEND] ' prefix
+    async sendMessage(content, functions, opts) {
+        opts = Object.assign({}, opts, { tag: this.context_id });
+        return this.context.sendMessage('user', '[BACKEND] ' + content, functions || this.functions, opts);
+    }
+
+    // Receive a user chat message (no [BACKEND] prefix)
+    async recvChatMessage(content, opts) {
+        opts = Object.assign({}, opts, { tag: this.context_id });
+        return this.context.sendMessage('user', content, null, opts);
     }
 
     // Serialize the session for persistence
@@ -72,12 +89,14 @@ class Sid extends Itask {
             id: this.id,
             name: this.name,
             prompt: this.prompt,
+            context_id: this.context_id,
             userData: this.userData,
             sessionConfig: this.sessionConfig,
             context: {
                 tag: this.context.tag,
                 msgs: this.context._msgs,
-                functions: this.context.functions
+                functions: this.context.functions,
+                chat_history: this.context.chat_history
             },
             tm_create: this.tm_create
         });
@@ -90,11 +109,14 @@ class Sid extends Itask {
         const sid = new Sid({
             name: parsed.name,
             prompt: parsed.prompt,
+            context_id: parsed.context_id,
             userData: parsed.userData,
             sessionConfig: parsed.sessionConfig,
             tag: parsed.context?.tag,
             tool_handler: opt.tool_handler,
             functions: opt.functions || parsed.context?.functions,
+            chat_history: parsed.context?.chat_history,
+            store: opt.store,
             async: true, // Don't auto-run states
             ...opt
         }, opt.states || []);
@@ -108,6 +130,11 @@ class Sid extends Itask {
             sid.context._msgs = parsed.context.msgs;
         }
 
+        // Load history from store if available
+        if (opt.store && parsed.context?.chat_history) {
+            sid.context.chat_history = parsed.context.chat_history;
+        }
+
         return sid;
     }
 
@@ -119,6 +146,7 @@ class Sid extends Itask {
         const childTask = new Itask({
             ...opt,
             spawn_parent: this,
+            store: this._store,
             async: true
         }, states);
 
@@ -150,6 +178,7 @@ class Sid extends Itask {
         const childTask = new Itask({
             ...opt,
             spawn_parent: this,
+            store: this._store,
             async: true
         }, states);
 

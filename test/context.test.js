@@ -6,6 +6,7 @@ const expect = chai.expect;
 
 const { Context, createContext } = require('../context.js');
 const Itask = require('../itask.js');
+const { Store } = require('../store.js');
 const openai = require('../openai.js');
 const util = require('../util.js');
 
@@ -26,11 +27,13 @@ describe('Context', function () {
         sandbox.stub(openai, 'send').resolves({ content: 'AI response' });
         mockToolHandler = sandbox.stub().resolves({ content: 'tool result', functions: null });
         Itask.root.clear();
+        Store.instance = null;
     });
 
     afterEach(() => {
         sandbox.restore();
         Itask.root.clear();
+        Store.instance = null;
     });
 
     describe('constructor', () => {
@@ -473,6 +476,111 @@ describe('Context', function () {
             // Check that summary was added to parent
             const parentSummaries = parentCtx.getSummaries();
             expect(parentSummaries.length).to.be.greaterThan(0);
+        });
+    });
+
+    describe('chat_history', () => {
+        it('should accept chat_history in config', () => {
+            const ctx = new Context(fakePrompt, null, { chat_history: 'some-data' });
+            expect(ctx.chat_history).to.equal('some-data');
+        });
+
+        it('should default chat_history to null', () => {
+            const ctx = new Context(fakePrompt, null, {});
+            expect(ctx.chat_history).to.be.null;
+        });
+    });
+
+    describe('cleanToolCallsByTag', () => {
+        it('should remove tool-related messages with matching tag', () => {
+            const ctx = new Context(fakePrompt, null, {});
+            const tag = 'test-tag';
+
+            ctx._msgs.push(
+                { msg: { role: 'user', content: 'Hello' }, opts: { tag }, msgid: '1', replied: 1 },
+                { msg: { role: 'assistant', content: 'Tool call', tool_calls: [{ id: 'tc1' }] }, opts: { tag }, msgid: '2', replied: 3 },
+                { msg: { role: 'tool', content: 'result', tool_call_id: 'tc1' }, opts: { tag }, msgid: '3', replied: 1 },
+                { msg: { role: 'assistant', content: 'Done' }, opts: { tag }, msgid: '4', replied: 3 }
+            );
+
+            ctx.cleanToolCallsByTag(tag);
+
+            expect(ctx._msgs).to.have.length(2);
+            expect(ctx._msgs[0].msg.content).to.equal('Hello');
+            expect(ctx._msgs[1].msg.content).to.equal('Done');
+        });
+
+        it('should not remove messages with different tag', () => {
+            const ctx = new Context(fakePrompt, null, {});
+
+            ctx._msgs.push(
+                { msg: { role: 'assistant', content: 'Tool call', tool_calls: [{ id: 'tc1' }] }, opts: { tag: 'other' }, msgid: '1', replied: 3 },
+                { msg: { role: 'tool', content: 'result' }, opts: { tag: 'other' }, msgid: '2', replied: 1 }
+            );
+
+            ctx.cleanToolCallsByTag('test-tag');
+
+            expect(ctx._msgs).to.have.length(2);
+        });
+    });
+
+    describe('loadHistory', () => {
+        it('should load and insert history messages', async () => {
+            const ctx = new Context(fakePrompt, null, { tag: 'test-tag' });
+            const mockStore = {
+                load: sandbox.stub().resolves({
+                    chat_history: JSON.stringify([
+                        { role: 'user', content: 'Old message' },
+                        { role: 'assistant', content: 'Old reply' }
+                    ])
+                })
+            };
+
+            await ctx.loadHistory(mockStore);
+
+            expect(ctx._msgs).to.have.length(2);
+            expect(ctx._msgs[0].msg.content).to.equal('Old message');
+            expect(ctx._msgs[1].msg.content).to.equal('Old reply');
+            expect(ctx._msgs[0].replied).to.equal(1);
+        });
+
+        it('should insert after system messages', async () => {
+            const ctx = new Context(fakePrompt, null, { tag: 'test-tag' });
+
+            // Add a system message first
+            ctx._msgs.push({
+                msg: { role: 'system', content: 'System instruction' },
+                opts: {},
+                msgid: 'sys1',
+                replied: 1
+            });
+
+            const mockStore = {
+                load: sandbox.stub().resolves({
+                    chat_history: JSON.stringify([
+                        { role: 'user', content: 'History msg' }
+                    ])
+                })
+            };
+
+            await ctx.loadHistory(mockStore);
+
+            expect(ctx._msgs).to.have.length(2);
+            expect(ctx._msgs[0].msg.role).to.equal('system');
+            expect(ctx._msgs[1].msg.content).to.equal('History msg');
+        });
+
+        it('should handle missing store gracefully', async () => {
+            const ctx = new Context(fakePrompt, null, {});
+            await ctx.loadHistory(null); // Should not throw
+            expect(ctx._msgs).to.have.length(0);
+        });
+
+        it('should handle missing data gracefully', async () => {
+            const ctx = new Context(fakePrompt, null, { tag: 'test-tag' });
+            const mockStore = { load: sandbox.stub().resolves(null) };
+            await ctx.loadHistory(mockStore);
+            expect(ctx._msgs).to.have.length(0);
         });
     });
 

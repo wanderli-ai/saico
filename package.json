@@ -20,6 +20,7 @@
     "openai.js",
     "util.js",
     "redis.js",
+    "store.js",
     "README.md",
     "LICENSE"
   ],

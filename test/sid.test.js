@@ -6,6 +6,7 @@ const expect = chai.expect;
 
 const { Sid, createSid } = require('../sid.js');
 const Itask = require('../itask.js');
+const { Store } = require('../store.js');
 const openai = require('../openai.js');
 const util = require('../util.js');
 
@@ -23,11 +24,13 @@ describe('Sid', function () {
         });
         sandbox.stub(openai, 'send').resolves({ content: 'AI response' });
         Itask.root.clear();
+        Store.instance = null;
     });
 
     afterEach(() => {
         sandbox.restore();
         Itask.root.clear();
+        Store.instance = null;
     });
 
     describe('constructor', () => {
@@ -37,6 +40,8 @@ describe('Sid', function () {
             expect(sid.prompt).to.equal(fakePrompt);
             expect(sid.context).to.exist;
             expect(sid.userData).to.deep.equal({});
+            expect(sid.context_id).to.be.a('string');
+            expect(sid.context_id.length).to.be.greaterThan(0);
         });
 
         it('should accept string as options', () => {
@@ -64,27 +69,64 @@ describe('Sid', function () {
     });
 
     describe('sendMessage', () => {
-        it('should send message using context', async () => {
+        it('should send message using context with [BACKEND] prefix', async () => {
             const sid = createSid({ name: 'session', prompt: fakePrompt });
 
-            const reply = await sid.sendMessage('user', 'Hello');
+            const reply = await sid.sendMessage('Hello');
 
             expect(reply).to.have.property('content', 'AI response');
             expect(openai.send.calledOnce).to.be.true;
+
+            // Verify [BACKEND] prefix was added
+            const sentArgs = openai.send.getCall(0).args[0];
+            const userMsg = sentArgs.find(m => m.role === 'user' && m.content.includes('Hello'));
+            expect(userMsg.content).to.equal('[BACKEND] Hello');
         });
 
         it('should include prompt in message queue', async () => {
             const sid = createSid({ name: 'session', prompt: fakePrompt });
 
-            await sid.sendMessage('user', 'Hello');
+            await sid.sendMessage('Hello');
 
             const sentArgs = openai.send.getCall(0).args[0];
             expect(sentArgs[0]).to.deep.equal({ role: 'system', content: fakePrompt });
         });
+
+        it('should tag messages with context_id', async () => {
+            const sid = createSid({ name: 'session', prompt: fakePrompt });
+
+            await sid.sendMessage('Hello');
+
+            const msgObj = sid.context._msgs.find(m => m.msg.content === '[BACKEND] Hello');
+            expect(msgObj.opts.tag).to.equal(sid.context_id);
+        });
+    });
+
+    describe('recvChatMessage', () => {
+        it('should send user chat message without [BACKEND] prefix', async () => {
+            const sid = createSid({ name: 'session', prompt: fakePrompt });
+
+            const reply = await sid.recvChatMessage('Hello from user');
+
+            expect(reply).to.have.property('content', 'AI response');
+
+            const sentArgs = openai.send.getCall(0).args[0];
+            const userMsg = sentArgs.find(m => m.role === 'user' && m.content.includes('Hello'));
+            expect(userMsg.content).to.equal('Hello from user');
+        });
+
+        it('should tag messages with context_id', async () => {
+            const sid = createSid({ name: 'session', prompt: fakePrompt });
+
+            await sid.recvChatMessage('User says hi');
+
+            const msgObj = sid.context._msgs.find(m => m.msg.content === 'User says hi');
+            expect(msgObj.opts.tag).to.equal(sid.context_id);
+        });
     });
 
     describe('serialization', () => {
-        it('should serialize session state', () => {
+        it('should serialize session state including context_id', () => {
             const sid = createSid({
                 name: 'test-session',
                 prompt: fakePrompt,
@@ -101,6 +143,7 @@ describe('Sid', function () {
             expect(parsed.prompt).to.equal(fakePrompt);
             expect(parsed.userData).to.deep.equal({ userId: '123' });
             expect(parsed.context.msgs).to.have.length(1);
+            expect(parsed.context_id).to.equal(sid.context_id);
         });
 
         it('should deserialize session state', () => {
@@ -121,6 +164,7 @@ describe('Sid', function () {
             expect(restored.userData).to.deep.equal({ userId: '123' });
             expect(restored.context.length).to.equal(2);
             expect(restored.id).to.equal(original.id);
+            expect(restored.context_id).to.equal(original.context_id);
         });
 
         it('should accept options when deserializing', () => {
@@ -136,6 +180,22 @@ describe('Sid', function () {
             });
 
             expect(restored.tool_handler).to.equal(mockHandler);
+        });
+
+        it('should preserve chat_history through serialization', () => {
+            const sid = createSid({
+                name: 'session',
+                prompt: fakePrompt
+            });
+
+            sid.context.chat_history = 'compressed-data-here';
+
+            const serialized = sid.serialize();
+            const parsed = JSON.parse(serialized);
+            expect(parsed.context.chat_history).to.equal('compressed-data-here');
+
+            const restored = Sid.deserialize(serialized);
+            expect(restored.context.chat_history).to.equal('compressed-data-here');
         });
     });
 

@@ -5,6 +5,7 @@ const sinon = require('sinon');
 const expect = chai.expect;
 
 const Itask = require('../itask.js');
+const { Store } = require('../store.js');
 
 describe('Itask', function () {
     let sandbox;
@@ -15,11 +16,13 @@ describe('Itask', function () {
             sandbox.stub(console, 'log');
         // Clear root registry before each test
         Itask.root.clear();
+        Store.instance = null;
     });
 
     afterEach(() => {
         sandbox.restore();
         Itask.root.clear();
+        Store.instance = null;
     });
 
     describe('constructor', () => {
@@ -55,6 +58,22 @@ describe('Itask', function () {
             }, []);
             expect(task.prompt).to.equal('Test prompt');
             expect(task.context).to.be.null;
+        });
+
+        it('should initialize context_id as null by default', () => {
+            const task = new Itask({ name: 'test', async: true }, []);
+            expect(task.context_id).to.be.null;
+        });
+
+        it('should accept explicit context_id', () => {
+            const task = new Itask({ name: 'test', context_id: 'custom-id', async: true }, []);
+            expect(task.context_id).to.equal('custom-id');
+        });
+
+        it('should accept store option', () => {
+            const mockStore = { generateId: () => 'mock-id', save: () => {}, load: () => {} };
+            const task = new Itask({ name: 'test', store: mockStore, async: true }, []);
+            expect(task._store).to.equal(mockStore);
         });
     });
 
@@ -209,6 +228,25 @@ describe('Itask', function () {
             task.setContext(mockContext);
 
             expect(task.context).to.equal(mockContext);
+        });
+
+        it('should generate context_id when setting context', () => {
+            const task = new Itask({ name: 'test', async: true }, []);
+            const mockContext = { prompt: 'test' };
+
+            task.setContext(mockContext);
+
+            expect(task.context_id).to.be.a('string');
+            expect(task.context_id.length).to.be.greaterThan(0);
+        });
+
+        it('should set context tag to context_id', () => {
+            const task = new Itask({ name: 'test', async: true }, []);
+            const mockContext = { prompt: 'test', tag: null };
+
+            task.setContext(mockContext);
+
+            expect(mockContext.tag).to.equal(task.context_id);
         });
 
         it('should get ancestor contexts', () => {
