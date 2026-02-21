@@ -1,6 +1,6 @@
 {
   "name": "saico",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "main": "index.js",
   "type": "commonjs",
   "description": "Hierarchical AI Conversation Orchestrator - Task hierarchy with conversation contexts",
@@ -44,7 +44,16 @@
     "test": "NODE_ENV=test mocha --exit 'test/**/*.test.js'",
     "start": "node server.js"
   },
-  "keywords": ["ai", "conversation", "orchestrator", "task", "hierarchy", "openai", "chatgpt", "llm"],
+  "keywords": [
+    "ai",
+    "conversation",
+    "orchestrator",
+    "task",
+    "hierarchy",
+    "openai",
+    "chatgpt",
+    "llm"
+  ],
   "author": "wanderli-ai",
   "license": "ISC"
 }

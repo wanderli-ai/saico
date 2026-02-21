@@ -182,6 +182,41 @@ describe('Sid', function () {
             expect(restored.tool_handler).to.equal(mockHandler);
         });
 
+        it('should preserve tool_digest through serialization round-trip', () => {
+            const sid = createSid({
+                name: 'session',
+                prompt: fakePrompt
+            });
+
+            const digest = [
+                { tool: 'myTool', result: 'some result', tm: Date.now() },
+                { tool: 'otherTool', result: 'other result', tm: Date.now() }
+            ];
+            sid.context.tool_digest = digest;
+
+            const serialized = sid.serialize();
+            const parsed = JSON.parse(serialized);
+            expect(parsed.context.tool_digest).to.deep.equal(digest);
+
+            const restored = Sid.deserialize(serialized);
+            expect(restored.context.tool_digest).to.deep.equal(digest);
+        });
+
+        it('should initialize tool_digest as empty array when not present in serialized data', () => {
+            const sid = createSid({
+                name: 'session',
+                prompt: fakePrompt
+            });
+
+            const serialized = sid.serialize();
+            // Remove tool_digest from parsed data
+            const parsed = JSON.parse(serialized);
+            delete parsed.context.tool_digest;
+
+            const restored = Sid.deserialize(JSON.stringify(parsed));
+            expect(restored.context.tool_digest).to.deep.equal([]);
+        });
+
         it('should preserve chat_history through serialization', () => {
             const sid = createSid({
                 name: 'session',

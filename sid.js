@@ -96,7 +96,8 @@ class Sid extends Itask {
                 tag: this.context.tag,
                 msgs: this.context._msgs,
                 functions: this.context.functions,
-                chat_history: this.context.chat_history
+                chat_history: this.context.chat_history,
+                tool_digest: this.context.tool_digest
             },
             tm_create: this.tm_create
         });
@@ -128,6 +129,11 @@ class Sid extends Itask {
         // Restore messages to context
         if (parsed.context?.msgs) {
             sid.context._msgs = parsed.context.msgs;
+        }
+
+        // Restore tool_digest
+        if (Array.isArray(parsed.context?.tool_digest)) {
+            sid.context.tool_digest = parsed.context.tool_digest;
         }
 
         // Load history from store if available

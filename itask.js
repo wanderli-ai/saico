@@ -720,8 +720,14 @@ Itask.prototype.closeContext = async function closeContext(){
         return true;
     }).map(m => m.msg);
 
-    if (cleanedMsgs.length > 0) {
-        const chat_history = await util.compressMessages(cleanedMsgs);
+    // Trim to last QUEUE_LIMIT before persisting
+    const queueLimit = this.context.QUEUE_LIMIT || 30;
+    const trimmedMsgs = cleanedMsgs.length > queueLimit
+        ? cleanedMsgs.slice(-queueLimit)
+        : cleanedMsgs;
+
+    if (trimmedMsgs.length > 0) {
+        const chat_history = await util.compressMessages(trimmedMsgs);
         this.context.chat_history = chat_history;
 
         // Persist to store
@@ -729,6 +735,7 @@ Itask.prototype.closeContext = async function closeContext(){
         if (store && this.context_id) {
             await store.save(this.context_id, {
                 chat_history,
+                tool_digest: this.context.tool_digest || [],
                 prompt: this.context.prompt,
                 tag: this.context.tag,
                 tm_closed: Date.now()

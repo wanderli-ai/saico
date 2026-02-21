@@ -46,6 +46,14 @@ class Context {
         this._processing_sequential = false;
         this._sequential_mode = config.sequential_mode || false;
 
+        // Queue structure limits
+        this.QUEUE_LIMIT = config.queue_limit ?? 30;
+        this.TOOL_DIGEST_LIMIT = config.tool_digest_limit ?? 10;
+        this.MIN_CHAT_MESSAGES = config.min_chat_messages ?? 10;
+
+        // Tool digest — persistent history of tool calls that mutated task state
+        this.tool_digest = config.tool_digest || [];
+
         // Initialize messages if provided
         (config.msgs || []).forEach(m => this.push(m));
 
@@ -59,6 +67,35 @@ class Context {
             this.tool_handler = task?.tool_handler;
         if (!this.functions)
             this.functions = task?.functions;
+    }
+
+    // Overridable: extending classes provide current state summary
+    getStateSummary() { return ''; }
+
+    // Snapshot all public (non-underscore) task properties for dirty detection.
+    // Mirrors the observable proxy convention: _ prefix = internal, ignored.
+    // Does NOT call serialize() — that is for persistence, not dirty detection.
+    _snapshotPublicProps(obj, seen = new Set()) {
+        if (typeof obj !== 'object' || obj === null) return obj;
+        if (seen.has(obj)) return undefined; // circular ref — skip
+        seen.add(obj);
+        const out = Array.isArray(obj) ? [] : {};
+        for (const key of Object.keys(obj)) {
+            if (!key.startsWith('_') && typeof obj[key] !== 'function')
+                out[key] = this._snapshotPublicProps(obj[key], seen);
+        }
+        seen.delete(obj);
+        return out;
+    }
+
+    // Append a tool result to the persistent tool digest
+    _appendToolDigest(toolName, resultContent) {
+        const truncated = typeof resultContent === 'string'
+            ? resultContent.slice(0, 500)
+            : String(resultContent ?? '').slice(0, 500);
+        this.tool_digest.push({ tool: toolName, result: truncated, tm: Date.now() });
+        if (this.tool_digest.length > this.TOOL_DIGEST_LIMIT)
+            this.tool_digest = this.tool_digest.slice(-this.TOOL_DIGEST_LIMIT);
     }
 
     // Get the parent context by traversing task hierarchy
@@ -248,6 +285,8 @@ class Context {
                     };
                 } else {
                     this._trackActiveToolCall(call);
+                    const _snap = this.task
+                        ? JSON.stringify(this._snapshotPublicProps(this.task)) : null;
 
                     try {
                         const correspondingDeferred = deferredGroup.find(d => d.call.id === call.id);
@@ -255,6 +294,9 @@ class Context {
                         const timeout = correspondingDeferred?.originalMessage.opts.timeout;
 
                         result = await this._executeToolCallWithTimeout(call, handler, timeout);
+                        if (_snap !== null &&
+                            _snap !== JSON.stringify(this._snapshotPublicProps(this.task)))
+                            this._appendToolDigest(call.function.name, result?.content || '');
                     } finally {
                         this._completeActiveToolCall(call);
                     }
@@ -405,7 +447,11 @@ class Context {
         if (!store || !this.tag)
             return;
         const data = await store.load(this.tag);
-        if (!data || !data.chat_history)
+        if (!data)
+            return;
+        if (Array.isArray(data.tool_digest))
+            this.tool_digest = data.tool_digest;
+        if (!data.chat_history)
             return;
         const messages = await util.decompressMessages(data.chat_history);
         if (!Array.isArray(messages) || messages.length === 0)
@@ -718,50 +764,82 @@ class Context {
         return validatedMsgs;
     }
 
-    // Build message queue - aggregates from task hierarchy
+    // Slice the last `limit` messages, walking back to avoid orphaning tool responses
+    // and expanding if fewer than MIN_CHAT_MESSAGES user/assistant messages are included.
+    _getQueueSlice(msgs, limit) {
+        if (msgs.length <= limit) return msgs;
+
+        let startIdx = msgs.length - limit;
+
+        // Walk backward if we'd start mid-tool-pair (tool response without its call)
+        while (startIdx > 0 && msgs[startIdx] && msgs[startIdx].role === 'tool')
+            startIdx--;
+
+        // Count user/assistant messages in the current window
+        let chatCount = 0;
+        for (let i = startIdx; i < msgs.length; i++) {
+            const role = msgs[i].role;
+            if (role === 'user' || role === 'assistant') chatCount++;
+        }
+
+        // Expand backward until we have at least MIN_CHAT_MESSAGES chat messages
+        while (chatCount < this.MIN_CHAT_MESSAGES && startIdx > 0) {
+            startIdx--;
+            const role = msgs[startIdx].role;
+            if (role === 'user' || role === 'assistant') chatCount++;
+        }
+
+        return msgs.slice(startIdx);
+    }
+
+    // Build message queue — layered structure:
+    //   Layer 1: System prompts from ancestor hierarchy + own prompt (transient)
+    //   Layer 2: [State Summary] from getStateSummary() override (transient, if non-empty)
+    //   Layer 3: [Tool Activity Log] from tool_digest (transient, if non-empty)
+    //   Layer 4: Ancestor summaries only + last QUEUE_LIMIT of own messages (persistent)
     _createMsgQ(add_tag, tag_filter) {
         const fullQueue = [];
-
-        // Get messages from ancestor contexts via task hierarchy
         const ancestorContexts = this.getAncestorContexts();
+
+        // Layer 1: System prompts from ancestor hierarchy + own prompt
         for (const ctx of ancestorContexts) {
             if (ctx.prompt) {
                 const prompt = {role: 'system', content: ctx.prompt};
-                if (add_tag)
-                    prompt.tag = ctx.tag;
+                if (add_tag) prompt.tag = ctx.tag;
                 fullQueue.push(prompt);
             }
-
-            let ctxMsgs;
-            if (tag_filter !== undefined) {
-                ctxMsgs = ctx._msgs.filter(m => {
-                    if (m.msg.role === 'system') return true;
-                    if (m.opts.summary) return true;
-                    if (m.opts.tag === tag_filter) return true;
-                    return false;
-                }).map(m => m.msg);
-            } else {
-                ctxMsgs = ctx.__msgs;
-            }
-
-            if (add_tag)
-                ctxMsgs = ctxMsgs.map(m => Object.assign({tag: ctx.tag}, m));
-
-            fullQueue.push(...ctxMsgs);
         }
-
-        // Add this context's prompt and messages
         if (this.prompt) {
             const prompt = {role: 'system', content: this.prompt};
-            if (add_tag)
-                prompt.tag = this.tag;
+            if (add_tag) prompt.tag = this.tag;
             fullQueue.push(prompt);
         }
 
+        // Layer 2: State summary (if non-empty)
+        const stateSummary = this.getStateSummary();
+        if (stateSummary)
+            fullQueue.push({role: 'system', content: '[State Summary]\n' + stateSummary});
+
+        // Layer 3: Tool digest (if non-empty)
+        if (this.tool_digest.length > 0) {
+            const digestText = this.tool_digest.map(entry =>
+                `[${new Date(entry.tm).toISOString()}] ${entry.tool}: ${entry.result}`
+            ).join('\n');
+            fullQueue.push({role: 'system', content: '[Tool Activity Log]\n' + digestText});
+        }
+
+        // Layer 4: Ancestor summaries only (no full ancestor messages)
+        for (const ctx of ancestorContexts) {
+            const summaries = ctx._msgs
+                .filter(m => m.opts.summary)
+                .map(m => add_tag ? Object.assign({}, m.msg, {tag: ctx.tag}) : m.msg);
+            fullQueue.push(...summaries);
+        }
+
+        // Own messages — filter by tag if requested, then slice to QUEUE_LIMIT
         let my_msgs;
         if (tag_filter !== undefined) {
             my_msgs = this._msgs.filter(m => {
-                if (m.msg.role === 'system') return true;
                 if (m.opts.summary) return true;
                 if (m.opts.tag === tag_filter) return true;
                 return false;
@@ -771,9 +849,9 @@ class Context {
         }
 
         if (add_tag)
-            my_msgs = my_msgs.map(m => Object.assign({tag: this.tag}, m));
+            my_msgs = my_msgs.map(m => Object.assign({}, m, {tag: this.tag}));
 
-        fullQueue.push(...my_msgs);
+        fullQueue.push(...this._getQueueSlice(my_msgs, this.QUEUE_LIMIT));
 
         return this._validateToolResponses(fullQueue);
     }
@@ -864,7 +942,6 @@ class Context {
                 this._processWaitingQueue();
             }
 
-            await this.summarizeMessages();
             Q = this._createMsgQ(false, o.opts?.tag);
 
             // Aggregate functions from hierarchy and merge with message-specific functions
@@ -939,11 +1016,16 @@ class Context {
 
                 for (const { call, isDuplicate } of toolCallsWithResults) {
                     if (!isDuplicate) {
+                        const _snap = this.task
+                            ? JSON.stringify(this._snapshotPublicProps(this.task)) : null;
                         try {
                             const result = await this._executeToolCallWithTimeout(
                                 call, o.opts?.handler, o.opts?.timeout);
                             const item = toolCallsWithResults.find(item => item.call.id === call.id);
                             if (item) item.result = result;
+                            if (_snap !== null &&
+                                _snap !== JSON.stringify(this._snapshotPublicProps(this.task)))
+                                this._appendToolDigest(call.function.name, result?.content || '');
                         } finally {
                             this._completeActiveToolCall(call);
                         }

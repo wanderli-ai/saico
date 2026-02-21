@@ -596,6 +596,141 @@ describe('Integration Tests', function () {
         });
     });
 
+    describe('Tool Digest Flow', () => {
+        it('should populate tool_digest when handler mutates task public properties', async () => {
+            const session = createSid({
+                name: 'session',
+                prompt: 'Session prompt'
+            });
+
+            const dirtyHandler = sandbox.stub().callsFake(async () => {
+                session.userData = { updated: true }; // mutates a non-_ property
+                return { content: 'dirty result' };
+            });
+            session.context.tool_handler = dirtyHandler;
+
+            const toolCallReply = {
+                content: 'Calling tool',
+                tool_calls: [{
+                    id: 'call_dirty',
+                    type: 'function',
+                    function: { name: 'dirty_tool', arguments: '{}' }
+                }]
+            };
+            openai.send.onFirstCall().resolves(toolCallReply);
+            openai.send.onSecondCall().resolves({ content: 'Done' });
+
+            await session.recvChatMessage('Do something dirty');
+
+            expect(session.context.tool_digest).to.have.length(1);
+            expect(session.context.tool_digest[0].tool).to.equal('dirty_tool');
+            expect(session.context.tool_digest[0].result).to.equal('dirty result');
+        });
+
+        it('should populate tool_digest when handler mutates itask state (non-_ property)', async () => {
+            const session = createSid({
+                name: 'session',
+                prompt: 'Session prompt'
+            });
+
+            // Handler mutates a public task property — detected automatically via snapshot
+            session.context.tool_handler = async () => {
+                session.info.lastAction = 'state_tool';
+                return { content: 'state was updated' };
+            };
+
+            const toolCallReply = {
+                content: 'Calling tool',
+                tool_calls: [{
+                    id: 'call_state',
+                    type: 'function',
+                    function: { name: 'state_tool', arguments: '{}' }
+                }]
+            };
+            openai.send.onFirstCall().resolves(toolCallReply);
+            openai.send.onSecondCall().resolves({ content: 'Done' });
+
+            await session.recvChatMessage('Update state');
+
+            expect(session.context.tool_digest).to.have.length(1);
+            expect(session.context.tool_digest[0].tool).to.equal('state_tool');
+            expect(session.context.tool_digest[0].result).to.equal('state was updated');
+        });
+
+        it('should not populate tool_digest when handler mutates nothing on the task', async () => {
+            const session = createSid({
+                name: 'session',
+                prompt: 'Session prompt',
+                tool_handler: mockToolHandler
+            });
+
+            mockToolHandler.resolves({ content: 'regular result' });
+
+            const toolCallReply = {
+                content: 'Calling tool',
+                tool_calls: [{
+                    id: 'call_normal',
+                    type: 'function',
+                    function: { name: 'normal_tool', arguments: '{}' }
+                }]
+            };
+            openai.send.onFirstCall().resolves(toolCallReply);
+            openai.send.onSecondCall().resolves({ content: 'Done' });
+
+            await session.recvChatMessage('Do something normal');
+
+            expect(session.context.tool_digest).to.have.length(0);
+        });
+
+        it('should include tool digest in subsequent OpenAI calls', async () => {
+            const session = createSid({
+                name: 'session',
+                prompt: 'Session prompt'
+            });
+
+            // Pre-populate tool_digest
+            session.context._appendToolDigest('prev_tool', 'previous result');
+
+            await session.recvChatMessage('Hello');
+
+            const sentArgs = openai.send.getCall(0).args[0];
+            const digestMsg = sentArgs.find(m =>
+                m.role === 'system' && m.content && m.content.includes('[Tool Activity Log]')
+            );
+            expect(digestMsg).to.exist;
+            expect(digestMsg.content).to.include('prev_tool');
+            expect(digestMsg.content).to.include('previous result');
+        });
+    });
+
+    describe('Queue Limit', () => {
+        it('should send at most QUEUE_LIMIT messages to OpenAI', async () => {
+            const session = createSid({
+                name: 'session',
+                prompt: 'Session prompt'
+            });
+            session.context.QUEUE_LIMIT = 10;
+            session.context.MIN_CHAT_MESSAGES = 0;
+
+            // Push 20 messages directly
+            for (let i = 0; i < 20; i++) {
+                session.context._msgs.push({
+                    msg: { role: 'user', content: `old msg ${i}` },
+                    opts: {},
+                    msgid: `old${i}`,
+                    replied: 1
+                });
+            }
+
+            await session.recvChatMessage('New message');
+
+            const sentArgs = openai.send.getCall(0).args[0];
+            const userMsgs = sentArgs.filter(m => m.role === 'user');
+            // Should have at most 10 user messages (the queue limit)
+            expect(userMsgs.length).to.be.at.most(10);
+        });
+    });
+
     describe('Full Persistence Flow', () => {
         it('should create session, send messages, close, and verify chat_history', async () => {
             const session = createSid({

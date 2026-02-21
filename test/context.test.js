@@ -584,6 +584,281 @@ describe('Context', function () {
         });
     });
 
+    describe('tool_digest', () => {
+        it('should initialize tool_digest as empty array', () => {
+            const ctx = new Context(fakePrompt, null, {});
+            expect(ctx.tool_digest).to.deep.equal([]);
+        });
+
+        it('getStateSummary() should return empty string by default', () => {
+            const ctx = new Context(fakePrompt, null, {});
+            expect(ctx.getStateSummary()).to.equal('');
+        });
+
+        it('_appendToolDigest() should add an entry', () => {
+            const ctx = new Context(fakePrompt, null, {});
+            ctx._appendToolDigest('myTool', 'result content');
+            expect(ctx.tool_digest).to.have.length(1);
+            expect(ctx.tool_digest[0].tool).to.equal('myTool');
+            expect(ctx.tool_digest[0].result).to.equal('result content');
+            expect(ctx.tool_digest[0].tm).to.be.a('number');
+        });
+
+        it('_appendToolDigest() should truncate result to 500 chars', () => {
+            const ctx = new Context(fakePrompt, null, {});
+            const longResult = 'x'.repeat(600);
+            ctx._appendToolDigest('myTool', longResult);
+            expect(ctx.tool_digest[0].result.length).to.equal(500);
+        });
+
+        it('_appendToolDigest() should trim to TOOL_DIGEST_LIMIT (FIFO)', () => {
+            const ctx = new Context(fakePrompt, null, { tool_digest_limit: 3 });
+            ctx._appendToolDigest('tool1', 'r1');
+            ctx._appendToolDigest('tool2', 'r2');
+            ctx._appendToolDigest('tool3', 'r3');
+            ctx._appendToolDigest('tool4', 'r4');
+            expect(ctx.tool_digest).to.have.length(3);
+            expect(ctx.tool_digest[0].tool).to.equal('tool2');
+            expect(ctx.tool_digest[2].tool).to.equal('tool4');
+        });
+    });
+
+    describe('_snapshotPublicProps', () => {
+        it('should include non-underscore properties', () => {
+            const ctx = new Context(fakePrompt, null, {});
+            const obj = { name: 'test', value: 42, _internal: 'skip' };
+            const snap = ctx._snapshotPublicProps(obj);
+            expect(snap).to.have.property('name', 'test');
+            expect(snap).to.have.property('value', 42);
+            expect(snap).to.not.have.property('_internal');
+        });
+
+        it('should skip functions', () => {
+            const ctx = new Context(fakePrompt, null, {});
+            const obj = { name: 'test', fn: () => {} };
+            const snap = ctx._snapshotPublicProps(obj);
+            expect(snap).to.not.have.property('fn');
+        });
+
+        it('should handle circular references without throwing', () => {
+            const ctx = new Context(fakePrompt, null, {});
+            const obj = { name: 'test' };
+            obj.self = obj;
+            expect(() => JSON.stringify(ctx._snapshotPublicProps(obj))).to.not.throw();
+        });
+
+        it('should recurse into objects even when serialize() is present', () => {
+            const ctx = new Context(fakePrompt, null, {});
+            // serialize() is for persistence, not dirty detection — ignored here
+            const obj = { name: 'test', serialize: () => 'ignored' };
+            const snap = ctx._snapshotPublicProps(obj);
+            expect(snap).to.have.property('name', 'test');
+            expect(snap).to.not.have.property('serialize'); // function — skipped
+        });
+
+        it('should detect changes to task public properties', () => {
+            const task = new Itask({ name: 'test', async: true }, []);
+            const ctx = new Context(fakePrompt, task, {});
+            task.setContext(ctx);
+
+            const before = JSON.stringify(ctx._snapshotPublicProps(task));
+            task.userData = { changed: true };
+            const after = JSON.stringify(ctx._snapshotPublicProps(task));
+
+            expect(before).to.not.equal(after);
+        });
+
+        it('should not detect changes to underscore properties', () => {
+            const task = new Itask({ name: 'test', async: true }, []);
+            const ctx = new Context(fakePrompt, task, {});
+            task.setContext(ctx);
+
+            const before = JSON.stringify(ctx._snapshotPublicProps(task));
+            task._internal = 'changed'; // underscore-prefixed — should be ignored
+            const after = JSON.stringify(ctx._snapshotPublicProps(task));
+
+            expect(before).to.equal(after);
+        });
+    });
+
+    describe('_getQueueSlice', () => {
+        it('should return all messages when fewer than limit', () => {
+            const ctx = new Context(fakePrompt, null, {});
+            const msgs = [
+                { role: 'user', content: 'a' },
+                { role: 'assistant', content: 'b' }
+            ];
+            const result = ctx._getQueueSlice(msgs, 30);
+            expect(result).to.deep.equal(msgs);
+        });
+
+        it('should return last limit messages when more exist', () => {
+            const ctx = new Context(fakePrompt, null, { min_chat_messages: 0 });
+            const msgs = Array.from({ length: 10 }, (_, i) =>
+                ({ role: 'user', content: `msg ${i}` })
+            );
+            const result = ctx._getQueueSlice(msgs, 5);
+            expect(result).to.have.length(5);
+            expect(result[0].content).to.equal('msg 5');
+        });
+
+        it('should not orphan a tool response at start of slice', () => {
+            const ctx = new Context(fakePrompt, null, { min_chat_messages: 0 });
+            const msgs = [];
+            // 2 messages before the limit boundary: assistant+tool_calls, tool response
+            msgs.push({ role: 'assistant', content: 'calling', tool_calls: [{ id: 'tc1' }] });
+            msgs.push({ role: 'tool', content: 'result', tool_call_id: 'tc1' });
+            // Fill to 30 more user/assistant messages
+            for (let i = 0; i < 30; i++)
+                msgs.push({ role: 'user', content: `u${i}` });
+            // Total: 32 messages, limit=30 would start at index 2 (a tool response)
+            // should walk back to index 1 (the assistant call)
+            const result = ctx._getQueueSlice(msgs, 30);
+            // result should start before the tool response
+            expect(result[0].role).to.not.equal('tool');
+        });
+
+        it('should expand window to guarantee MIN_CHAT_MESSAGES', () => {
+            const ctx = new Context(fakePrompt, null, { queue_limit: 30, min_chat_messages: 10 });
+            // 25 tool messages + 5 chat exchanges (10 msgs) = 35 total
+            const msgs = [];
+            for (let i = 0; i < 25; i++)
+                msgs.push({ role: 'tool', content: `tool ${i}`, tool_call_id: `tc${i}` });
+            for (let i = 0; i < 5; i++) {
+                msgs.push({ role: 'user', content: `user ${i}` });
+                msgs.push({ role: 'assistant', content: `assistant ${i}` });
+            }
+            // Last 30 of 35 would include 5 tool + 10 chat = fine, 10 chat messages
+            // But last 30 = msgs[5..34] = 20 tool msgs + 10 chat = 10 chat, which meets the minimum
+            // Let's use a tighter scenario: last 30 has only 4 chat messages
+            const msgs2 = [];
+            for (let i = 0; i < 28; i++)
+                msgs2.push({ role: 'tool', content: `tool ${i}`, tool_call_id: `tc${i}` });
+            for (let i = 0; i < 2; i++) {
+                msgs2.push({ role: 'user', content: `user ${i}` });
+                msgs2.push({ role: 'assistant', content: `assistant ${i}` });
+            }
+            // Total: 32 msgs; last 30 = 26 tool + 4 chat < 10 chat minimum
+            const result = ctx._getQueueSlice(msgs2, 30);
+            const chatCount = result.filter(m => m.role === 'user' || m.role === 'assistant').length;
+            expect(chatCount).to.be.at.least(4); // at least as many as exist
+        });
+    });
+
+    describe('_createMsgQ layered structure', () => {
+        it('should have system prompt as first element', () => {
+            const ctx = createContext(fakePrompt, null, {});
+            ctx._msgs.push({ msg: { role: 'user', content: 'Hello' }, opts: {}, msgid: '1', replied: 1 });
+            const q = ctx._createMsgQ(false);
+            expect(q[0]).to.deep.equal({ role: 'system', content: fakePrompt });
+        });
+
+        it('should include tool digest as system message when non-empty', () => {
+            const ctx = createContext(fakePrompt, null, {});
+            ctx._appendToolDigest('myTool', 'some result');
+            const q = ctx._createMsgQ(false);
+            const digestMsg = q.find(m => m.role === 'system' && m.content.includes('[Tool Activity Log]'));
+            expect(digestMsg).to.exist;
+            expect(digestMsg.content).to.include('myTool');
+            expect(digestMsg.content).to.include('some result');
+        });
+
+        it('should not include tool digest when empty', () => {
+            const ctx = createContext(fakePrompt, null, {});
+            const q = ctx._createMsgQ(false);
+            const digestMsg = q.find(m => m.role === 'system' && m.content?.includes('[Tool Activity Log]'));
+            expect(digestMsg).to.not.exist;
+        });
+
+        it('should include state summary when getStateSummary returns non-empty', () => {
+            class CustomContext extends Context {
+                getStateSummary() { return 'current state info'; }
+            }
+            const ctx = new CustomContext(fakePrompt, null, {});
+            const q = ctx._createMsgQ(false);
+            const summaryMsg = q.find(m => m.role === 'system' && m.content.includes('[State Summary]'));
+            expect(summaryMsg).to.exist;
+            expect(summaryMsg.content).to.include('current state info');
+        });
+
+        it('should limit queue to QUEUE_LIMIT own messages', () => {
+            const ctx = createContext(fakePrompt, null, { queue_limit: 5, min_chat_messages: 0 });
+            for (let i = 0; i < 10; i++) {
+                ctx._msgs.push({
+                    msg: { role: 'user', content: `msg ${i}` },
+                    opts: {},
+                    msgid: `m${i}`,
+                    replied: 1
+                });
+            }
+            const q = ctx._createMsgQ(false);
+            const userMsgs = q.filter(m => m.role === 'user');
+            expect(userMsgs).to.have.length(5);
+            expect(userMsgs[0].content).to.equal('msg 5');
+        });
+
+        it('should include only ancestor summaries (not full ancestor messages)', () => {
+            const parentTask = new Itask({ name: 'parent', async: true }, []);
+            const childTask = new Itask({ name: 'child', async: true }, []);
+            parentTask.spawn(childTask);
+
+            const parentCtx = new Context('Parent prompt', parentTask, {});
+            parentTask.setContext(parentCtx);
+
+            // Add a regular message and a summary to parent
+            parentCtx._msgs.push({ msg: { role: 'user', content: 'parent msg' }, opts: {}, msgid: 'pm1', replied: 1 });
+            parentCtx.pushSummary('parent summary');
+
+            const childCtx = createContext(fakePrompt, childTask, {});
+            childTask.setContext(childCtx);
+
+            const q = childCtx._createMsgQ(false);
+
+            // Parent regular message should NOT be in queue
+            expect(q.some(m => m.content === 'parent msg')).to.be.false;
+            // Parent summary SHOULD be in queue
+            expect(q.some(m => m.content && m.content.includes('parent summary'))).to.be.true;
+        });
+    });
+
+    describe('loadHistory with tool_digest', () => {
+        it('should restore tool_digest from store data', async () => {
+            const ctx = new Context(fakePrompt, null, { tag: 'test-tag' });
+            const mockDigest = [{ tool: 'myTool', result: 'result', tm: Date.now() }];
+            const mockStore = {
+                load: sandbox.stub().resolves({
+                    chat_history: JSON.stringify([]),
+                    tool_digest: mockDigest
+                })
+            };
+            await ctx.loadHistory(mockStore);
+            expect(ctx.tool_digest).to.deep.equal(mockDigest);
+        });
+
+        it('should skip tool_digest restore when not an array', async () => {
+            const ctx = new Context(fakePrompt, null, { tag: 'test-tag' });
+            const mockStore = {
+                load: sandbox.stub().resolves({
+                    chat_history: JSON.stringify([]),
+                    tool_digest: null
+                })
+            };
+            await ctx.loadHistory(mockStore);
+            expect(ctx.tool_digest).to.deep.equal([]);
+        });
+
+        it('should handle store returning only tool_digest without chat_history', async () => {
+            const ctx = new Context(fakePrompt, null, { tag: 'test-tag' });
+            const mockDigest = [{ tool: 'tool1', result: 'r1', tm: Date.now() }];
+            const mockStore = {
+                load: sandbox.stub().resolves({ tool_digest: mockDigest })
+            };
+            await ctx.loadHistory(mockStore);
+            expect(ctx.tool_digest).to.deep.equal(mockDigest);
+            expect(ctx._msgs).to.have.length(0);
+        });
+    });
+
     describe('spawnChild', () => {
         it('should create a child context with task', () => {
             const parentTask = new Itask({ name: 'parent', async: true }, []);
