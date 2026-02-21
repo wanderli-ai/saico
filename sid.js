@@ -38,6 +38,8 @@ class Sid extends Itask {
             token_limit: opt.token_limit,
             max_depth: opt.max_depth,
             max_tool_repetition: opt.max_tool_repetition,
+            queue_limit: opt.queue_limit,
+            min_chat_messages: opt.min_chat_messages,
             ...opt.sessionConfig
         };
 
@@ -53,6 +55,8 @@ class Sid extends Itask {
             token_limit: this.sessionConfig.token_limit,
             max_depth: this.sessionConfig.max_depth,
             max_tool_repetition: this.sessionConfig.max_tool_repetition,
+            queue_limit: this.sessionConfig.queue_limit,
+            min_chat_messages: this.sessionConfig.min_chat_messages,
             tool_handler: opt.tool_handler,
             functions: opt.functions,
             sequential_mode: opt.sequential_mode,
@@ -162,6 +166,8 @@ class Sid extends Itask {
                 token_limit: opt.token_limit || this.sessionConfig.token_limit,
                 max_depth: opt.max_depth || this.sessionConfig.max_depth,
                 max_tool_repetition: opt.max_tool_repetition || this.sessionConfig.max_tool_repetition,
+                queue_limit: opt.queue_limit ?? this.sessionConfig.queue_limit,
+                min_chat_messages: opt.min_chat_messages ?? this.sessionConfig.min_chat_messages,
                 tool_handler: opt.tool_handler || this.tool_handler,
                 functions: opt.functions || this.functions
             });
