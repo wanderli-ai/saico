@@ -78,7 +78,7 @@ function Itask(opt, states){
 
     EventEmitter.call(this);
     opt = opt || {};
-    this.id = makeId(10);
+    this.id = opt.id || makeId(10);
     this.name = opt.name;
     this.cancelable = !!opt.cancel;
     this.info = opt.info || {};
@@ -745,6 +745,10 @@ Itask.prototype.closeContext = async function closeContext(){
 
     await this.context.close();
 };
+
+// Overridable: contextless tasks can provide a state summary that bubbles up
+// into the nearest ancestor context's _getStateSummary().
+Itask.prototype.getStateSummary = function getStateSummary(){ return ''; };
 
 // Reference to Context class (set by index.js to avoid circular dependency)
 Itask.Context = null;

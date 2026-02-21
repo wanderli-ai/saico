@@ -34,6 +34,11 @@ describe('Itask', function () {
             expect(task.id).to.be.a('string');
         });
 
+        it('should use opt.id when provided instead of generating one', () => {
+            const task = new Itask({ name: 'test', id: 'my-custom-id', async: true }, []);
+            expect(task.id).to.equal('my-custom-id');
+        });
+
         it('should register task in root if no parent', () => {
             const task = new Itask({ name: 'root-task', async: true }, []);
             expect(Itask.root.has(task)).to.be.true;

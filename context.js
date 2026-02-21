@@ -72,6 +72,36 @@ class Context {
     // Overridable: extending classes provide current state summary
     getStateSummary() { return ''; }
 
+    // Recursively collect state summaries from child tasks that have no context
+    // (no msg Q), stopping at children that do have one.
+    _collectChildStateSummaries(task) {
+        if (!task.child || !task.child.size) return '';
+        const parts = [];
+        for (const child of task.child) {
+            if (child.context) continue; // has its own Q — boundary, stop here
+            if (typeof child.getStateSummary === 'function') {
+                const s = child.getStateSummary();
+                if (s) parts.push(s);
+            }
+            const nested = this._collectChildStateSummaries(child);
+            if (nested) parts.push(nested);
+        }
+        return parts.join('\n');
+    }
+
+    // Internal (not overridable): own getStateSummary() + summaries from all
+    // contextless descendants, stopping at the first child that has its own Q.
+    _getStateSummary() {
+        const parts = [];
+        const own = this.getStateSummary();
+        if (own) parts.push(own);
+        if (this.task) {
+            const childSummaries = this._collectChildStateSummaries(this.task);
+            if (childSummaries) parts.push(childSummaries);
+        }
+        return parts.join('\n');
+    }
+
     // Snapshot all public (non-underscore) task properties for dirty detection.
     // Mirrors the observable proxy convention: _ prefix = internal, ignored.
     // Does NOT call serialize() — that is for persistence, not dirty detection.
@@ -808,7 +838,7 @@ class Context {
                 if (add_tag) prompt.tag = ctx.tag;
                 fullQueue.push(prompt);
             }
-            const ctxSummary = ctx.getStateSummary();
+            const ctxSummary = ctx._getStateSummary();
             if (ctxSummary)
                 fullQueue.push({role: 'system', content: '[State Summary]\n' + ctxSummary});
         }
@@ -817,7 +847,7 @@ class Context {
             if (add_tag) prompt.tag = this.tag;
             fullQueue.push(prompt);
         }
-        const stateSummary = this.getStateSummary();
+        const stateSummary = this._getStateSummary();
         if (stateSummary)
             fullQueue.push({role: 'system', content: '[State Summary]\n' + stateSummary});
 

@@ -770,7 +770,7 @@ describe('Context', function () {
             expect(digestMsg).to.not.exist;
         });
 
-        it('should include own state summary when getStateSummary returns non-empty', () => {
+        it('should include own state summary via _getStateSummary', () => {
             class CustomContext extends Context {
                 getStateSummary() { return 'current state info'; }
             }
@@ -831,6 +831,41 @@ describe('Context', function () {
             expect(systemMsgs[1].content).to.include('state here');
             expect(systemMsgs[2].content).to.equal(fakePrompt);
             expect(systemMsgs[3].content).to.include('state here');
+        });
+
+        it('_getStateSummary should collect from contextless child tasks recursively', () => {
+            const parentTask = new Itask({ name: 'parent', async: true }, []);
+            const childNoCtx = new Itask({ name: 'child-no-ctx', async: true }, []);
+            const grandchildNoCtx = new Itask({ name: 'grandchild-no-ctx', async: true }, []);
+            parentTask.spawn(childNoCtx);
+            childNoCtx.child.add(grandchildNoCtx);
+            grandchildNoCtx.parent = childNoCtx;
+
+            childNoCtx.getStateSummary = () => 'child state';
+            grandchildNoCtx.getStateSummary = () => 'grandchild state';
+
+            const ctx = new Context(fakePrompt, parentTask, {});
+            parentTask.setContext(ctx);
+
+            const summary = ctx._getStateSummary();
+            expect(summary).to.include('child state');
+            expect(summary).to.include('grandchild state');
+        });
+
+        it('_getStateSummary should stop at children that have their own context', () => {
+            const parentTask = new Itask({ name: 'parent', async: true }, []);
+            const childWithCtx = new Itask({ name: 'child-with-ctx', async: true }, []);
+            parentTask.spawn(childWithCtx);
+
+            const childCtx = new Context('child prompt', childWithCtx, {});
+            childWithCtx.setContext(childCtx);
+            childWithCtx.getStateSummary = () => 'should not appear';
+
+            const parentCtx = new Context(fakePrompt, parentTask, {});
+            parentTask.setContext(parentCtx);
+
+            const summary = parentCtx._getStateSummary();
+            expect(summary).to.not.include('should not appear');
         });
 
         it('should limit queue to QUEUE_LIMIT own messages', () => {
