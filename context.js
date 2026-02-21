@@ -801,21 +801,22 @@ class Context {
         const fullQueue = [];
         const ancestorContexts = this.getAncestorContexts();
 
-        // Layer 1: System prompts from ancestor hierarchy + own prompt
+        // Layer 1+2: Each level's prompt followed immediately by its state summary
         for (const ctx of ancestorContexts) {
             if (ctx.prompt) {
                 const prompt = {role: 'system', content: ctx.prompt};
                 if (add_tag) prompt.tag = ctx.tag;
                 fullQueue.push(prompt);
             }
+            const ctxSummary = ctx.getStateSummary();
+            if (ctxSummary)
+                fullQueue.push({role: 'system', content: '[State Summary]\n' + ctxSummary});
         }
         if (this.prompt) {
             const prompt = {role: 'system', content: this.prompt};
             if (add_tag) prompt.tag = this.tag;
             fullQueue.push(prompt);
         }
-
-        // Layer 2: State summary (if non-empty)
         const stateSummary = this.getStateSummary();
         if (stateSummary)
             fullQueue.push({role: 'system', content: '[State Summary]\n' + stateSummary});

@@ -770,7 +770,7 @@ describe('Context', function () {
             expect(digestMsg).to.not.exist;
         });
 
-        it('should include state summary when getStateSummary returns non-empty', () => {
+        it('should include own state summary when getStateSummary returns non-empty', () => {
             class CustomContext extends Context {
                 getStateSummary() { return 'current state info'; }
             }
@@ -779,6 +779,58 @@ describe('Context', function () {
             const summaryMsg = q.find(m => m.role === 'system' && m.content.includes('[State Summary]'));
             expect(summaryMsg).to.exist;
             expect(summaryMsg.content).to.include('current state info');
+        });
+
+        it('should include state summaries from all ancestor contexts', () => {
+            const parentTask = new Itask({ name: 'parent', async: true }, []);
+            const childTask = new Itask({ name: 'child', async: true }, []);
+            parentTask.spawn(childTask);
+
+            class StatefulContext extends Context {
+                constructor(prompt, task, config, summary) {
+                    super(prompt, task, config);
+                    this._summary = summary;
+                }
+                getStateSummary() { return this._summary; }
+            }
+
+            const parentCtx = new StatefulContext('Parent prompt', parentTask, {}, 'parent state');
+            parentTask.setContext(parentCtx);
+
+            const childCtx = new StatefulContext(fakePrompt, childTask, {}, 'child state');
+            childTask.setContext(childCtx);
+
+            const q = childCtx._createMsgQ(false);
+            const summaryMsgs = q.filter(m => m.role === 'system' && m.content.includes('[State Summary]'));
+
+            expect(summaryMsgs).to.have.length(2);
+            expect(summaryMsgs[0].content).to.include('parent state');
+            expect(summaryMsgs[1].content).to.include('child state');
+        });
+
+        it('should place each state summary immediately after its context prompt', () => {
+            const parentTask = new Itask({ name: 'parent', async: true }, []);
+            const childTask = new Itask({ name: 'child', async: true }, []);
+            parentTask.spawn(childTask);
+
+            class StatefulContext extends Context {
+                getStateSummary() { return 'state here'; }
+            }
+
+            const parentCtx = new StatefulContext('Parent prompt', parentTask, {});
+            parentTask.setContext(parentCtx);
+
+            const childCtx = new StatefulContext(fakePrompt, childTask, {});
+            childTask.setContext(childCtx);
+
+            const q = childCtx._createMsgQ(false);
+            const systemMsgs = q.filter(m => m.role === 'system');
+
+            // Order: parent prompt, parent state, child prompt, child state, [tool digest]
+            expect(systemMsgs[0].content).to.equal('Parent prompt');
+            expect(systemMsgs[1].content).to.include('state here');
+            expect(systemMsgs[2].content).to.equal(fakePrompt);
+            expect(systemMsgs[3].content).to.include('state here');
         });
 
         it('should limit queue to QUEUE_LIMIT own messages', () => {
