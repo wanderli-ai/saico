@@ -19,9 +19,11 @@
  */
 
 const Itask = require('./itask.js');
-const { Context, createContext } = require('./context.js');
+const { Context, createContext } = require('./msgs.js');
 const { Sid, createSid } = require('./sid.js');
 const { Store, DynamoBackend } = require('./store.js');
+const { Saico } = require('./saico.js');
+const { DynamoDBAdapter } = require('./dynamo.js');
 
 // Wire up Context class reference in Itask to avoid circular dependency
 Itask.Context = Context;
@@ -135,6 +137,10 @@ function createQ(prompt, parent, tag, token_limit, msgs, tool_handler, config = 
 
 // Export all components
 module.exports = {
+    // Master class (external users extend this)
+    Saico,
+    DynamoDBAdapter,
+
     // Core classes
     Itask,
     Context,

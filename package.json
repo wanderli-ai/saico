@@ -1,6 +1,6 @@
 {
   "name": "saico",
-  "version": "2.2.3",
+  "version": "2.3.0",
   "main": "index.js",
   "type": "commonjs",
   "description": "Hierarchical AI Conversation Orchestrator - Task hierarchy with conversation contexts",
@@ -16,7 +16,10 @@
     "index.js",
     "itask.js",
     "context.js",
+    "msgs.js",
     "sid.js",
+    "saico.js",
+    "dynamo.js",
     "openai.js",
     "util.js",
     "redis.js",
@@ -31,6 +34,16 @@
     "openai": "^4.85.4",
     "tiktoken": "^1.0.17",
     "redis": "^4.7.0"
+  },
+  "peerDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.0.0",
+    "@aws-sdk/lib-dynamodb": "^3.0.0",
+    "@aws-sdk/util-dynamodb": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-dynamodb": { "optional": true },
+    "@aws-sdk/lib-dynamodb": { "optional": true },
+    "@aws-sdk/util-dynamodb": { "optional": true }
   },
   "devDependencies": {
     "chai": "^4.5.0",
