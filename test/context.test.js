@@ -219,28 +219,37 @@ describe('Context', function () {
             expect(sentArgs[0]).to.deep.equal({ role: 'system', content: fakePrompt });
         });
 
-        it('should include parent context in openai.send', async () => {
-            const parentTask = new Itask({ name: 'parent', async: true }, []);
-            const childTask = new Itask({ name: 'child', async: true }, []);
-            parentTask.spawn(childTask);
+        it('should include own prompt in standalone mode', async () => {
+            const ctx = createContext(fakePrompt, null, {});
+            ctx.pushSummary('child summary');
 
-            const parentCtx = new Context('Parent prompt', parentTask, {});
-            parentTask.setContext(parentCtx);
-            parentCtx.pushSummary('parent summary');
-
-            const childCtx = createContext(fakePrompt, childTask, {});
-            childTask.setContext(childCtx);
-            childCtx.pushSummary('child summary');
-
-            await childCtx.sendMessage('user', 'Hi', null, {});
+            await ctx.sendMessage('user', 'Hi', null, {});
 
             const sentArgs = openai.send.getCall(0).args[0];
-            expect(sentArgs).to.deep.include.members([
-                { role: 'system', content: 'Parent prompt' },
-                { role: 'user', content: '[SUMMARY]: parent summary' },
-                { role: 'system', content: fakePrompt },
-                { role: 'user', content: '[SUMMARY]: child summary' }
-            ]);
+            expect(sentArgs[0]).to.deep.equal({ role: 'system', content: fakePrompt });
+            expect(sentArgs.some(m => m.content?.includes('child summary'))).to.be.true;
+        });
+
+        it('should use preamble when passed through opts', async () => {
+            const ctx = createContext(fakePrompt, null, {});
+
+            const preamble = [
+                { role: 'system', content: 'Root prompt' },
+                { role: 'system', content: 'Child prompt' },
+            ];
+
+            await ctx.sendMessage('user', 'Hi', null, {
+                _preamble: preamble,
+                _aggregatedFunctions: [{ name: 'test_func' }],
+            });
+
+            const sentArgs = openai.send.getCall(0).args[0];
+            expect(sentArgs[0]).to.deep.equal({ role: 'system', content: 'Root prompt' });
+            expect(sentArgs[1]).to.deep.equal({ role: 'system', content: 'Child prompt' });
+
+            const sentFuncs = openai.send.getCall(0).args[1];
+            expect(sentFuncs).to.have.length(1);
+            expect(sentFuncs[0].name).to.equal('test_func');
         });
 
         it('should skip if no content', async () => {
@@ -590,11 +599,6 @@ describe('Context', function () {
             expect(ctx.tool_digest).to.deep.equal([]);
         });
 
-        it('getStateSummary() should return empty string by default', () => {
-            const ctx = new Context(fakePrompt, null, {});
-            expect(ctx.getStateSummary()).to.equal('');
-        });
-
         it('_appendToolDigest() should add an entry', () => {
             const ctx = new Context(fakePrompt, null, {});
             ctx._appendToolDigest('myTool', 'result content');
@@ -746,126 +750,63 @@ describe('Context', function () {
     });
 
     describe('_createMsgQ layered structure', () => {
-        it('should have system prompt as first element', () => {
+        it('should have system prompt as first element (standalone fallback)', () => {
             const ctx = createContext(fakePrompt, null, {});
             ctx._msgs.push({ msg: { role: 'user', content: 'Hello' }, opts: {}, msgid: '1', replied: 1 });
-            const q = ctx._createMsgQ(false);
+            const q = ctx._createMsgQ(null, false);
             expect(q[0]).to.deep.equal({ role: 'system', content: fakePrompt });
         });
 
-        it('should include tool digest as system message when non-empty', () => {
+        it('should include tool digest in standalone fallback', () => {
             const ctx = createContext(fakePrompt, null, {});
             ctx._appendToolDigest('myTool', 'some result');
-            const q = ctx._createMsgQ(false);
+            const q = ctx._createMsgQ(null, false);
             const digestMsg = q.find(m => m.role === 'system' && m.content.includes('[Tool Activity Log]'));
             expect(digestMsg).to.exist;
             expect(digestMsg.content).to.include('myTool');
             expect(digestMsg.content).to.include('some result');
         });
 
-        it('should not include tool digest when empty', () => {
+        it('should not include tool digest when empty (standalone fallback)', () => {
             const ctx = createContext(fakePrompt, null, {});
-            const q = ctx._createMsgQ(false);
+            const q = ctx._createMsgQ(null, false);
             const digestMsg = q.find(m => m.role === 'system' && m.content?.includes('[Tool Activity Log]'));
             expect(digestMsg).to.not.exist;
         });
 
-        it('should include own state summary via _getStateSummary', () => {
-            class CustomContext extends Context {
-                getStateSummary() { return 'current state info'; }
-            }
-            const ctx = new CustomContext(fakePrompt, null, {});
-            const q = ctx._createMsgQ(false);
-            const summaryMsg = q.find(m => m.role === 'system' && m.content.includes('[State Summary]'));
-            expect(summaryMsg).to.exist;
-            expect(summaryMsg.content).to.include('current state info');
+        it('should use preamble when provided (Saico orchestration)', () => {
+            const ctx = createContext(fakePrompt, null, {});
+            ctx._msgs.push({ msg: { role: 'user', content: 'Hello' }, opts: {}, msgid: '1', replied: 1 });
+
+            const preamble = [
+                { role: 'system', content: 'Root prompt' },
+                { role: 'system', content: '[State Summary]\nRoot state' },
+                { role: 'system', content: 'Child prompt' },
+            ];
+
+            const q = ctx._createMsgQ(preamble, false);
+
+            // Preamble should be first
+            expect(q[0]).to.deep.equal({ role: 'system', content: 'Root prompt' });
+            expect(q[1]).to.deep.equal({ role: 'system', content: '[State Summary]\nRoot state' });
+            expect(q[2]).to.deep.equal({ role: 'system', content: 'Child prompt' });
+            // Own messages follow
+            expect(q[3]).to.deep.equal({ role: 'user', content: 'Hello' });
         });
 
-        it('should include state summaries from all ancestor contexts', () => {
-            const parentTask = new Itask({ name: 'parent', async: true }, []);
-            const childTask = new Itask({ name: 'child', async: true }, []);
-            parentTask.spawn(childTask);
+        it('should NOT include own prompt/digest when preamble is provided', () => {
+            const ctx = createContext(fakePrompt, null, {});
+            ctx._appendToolDigest('myTool', 'some result');
 
-            class StatefulContext extends Context {
-                constructor(prompt, task, config, summary) {
-                    super(prompt, task, config);
-                    this._summary = summary;
-                }
-                getStateSummary() { return this._summary; }
-            }
+            const preamble = [{ role: 'system', content: 'Saico prompt' }];
+            const q = ctx._createMsgQ(preamble, false);
 
-            const parentCtx = new StatefulContext('Parent prompt', parentTask, {}, 'parent state');
-            parentTask.setContext(parentCtx);
-
-            const childCtx = new StatefulContext(fakePrompt, childTask, {}, 'child state');
-            childTask.setContext(childCtx);
-
-            const q = childCtx._createMsgQ(false);
-            const summaryMsgs = q.filter(m => m.role === 'system' && m.content.includes('[State Summary]'));
-
-            expect(summaryMsgs).to.have.length(2);
-            expect(summaryMsgs[0].content).to.include('parent state');
-            expect(summaryMsgs[1].content).to.include('child state');
-        });
-
-        it('should place each state summary immediately after its context prompt', () => {
-            const parentTask = new Itask({ name: 'parent', async: true }, []);
-            const childTask = new Itask({ name: 'child', async: true }, []);
-            parentTask.spawn(childTask);
-
-            class StatefulContext extends Context {
-                getStateSummary() { return 'state here'; }
-            }
-
-            const parentCtx = new StatefulContext('Parent prompt', parentTask, {});
-            parentTask.setContext(parentCtx);
-
-            const childCtx = new StatefulContext(fakePrompt, childTask, {});
-            childTask.setContext(childCtx);
-
-            const q = childCtx._createMsgQ(false);
-            const systemMsgs = q.filter(m => m.role === 'system');
-
-            // Order: parent prompt, parent state, child prompt, child state, [tool digest]
-            expect(systemMsgs[0].content).to.equal('Parent prompt');
-            expect(systemMsgs[1].content).to.include('state here');
-            expect(systemMsgs[2].content).to.equal(fakePrompt);
-            expect(systemMsgs[3].content).to.include('state here');
-        });
-
-        it('_getStateSummary should collect from contextless child tasks recursively', () => {
-            const parentTask = new Itask({ name: 'parent', async: true }, []);
-            const childNoCtx = new Itask({ name: 'child-no-ctx', async: true }, []);
-            const grandchildNoCtx = new Itask({ name: 'grandchild-no-ctx', async: true }, []);
-            parentTask.spawn(childNoCtx);
-            childNoCtx.child.add(grandchildNoCtx);
-            grandchildNoCtx.parent = childNoCtx;
-
-            childNoCtx.getStateSummary = () => 'child state';
-            grandchildNoCtx.getStateSummary = () => 'grandchild state';
-
-            const ctx = new Context(fakePrompt, parentTask, {});
-            parentTask.setContext(ctx);
-
-            const summary = ctx._getStateSummary();
-            expect(summary).to.include('child state');
-            expect(summary).to.include('grandchild state');
-        });
-
-        it('_getStateSummary should stop at children that have their own context', () => {
-            const parentTask = new Itask({ name: 'parent', async: true }, []);
-            const childWithCtx = new Itask({ name: 'child-with-ctx', async: true }, []);
-            parentTask.spawn(childWithCtx);
-
-            const childCtx = new Context('child prompt', childWithCtx, {});
-            childWithCtx.setContext(childCtx);
-            childWithCtx.getStateSummary = () => 'should not appear';
-
-            const parentCtx = new Context(fakePrompt, parentTask, {});
-            parentTask.setContext(parentCtx);
-
-            const summary = parentCtx._getStateSummary();
-            expect(summary).to.not.include('should not appear');
+            // Own prompt should NOT appear (only preamble content)
+            expect(q.filter(m => m.content === fakePrompt)).to.have.length(0);
+            // Tool digest from own context should NOT appear in standalone section
+            const digestFromStandalone = q.filter(m =>
+                m.role === 'system' && m.content?.includes('[Tool Activity Log]'));
+            expect(digestFromStandalone).to.have.length(0);
         });
 
         it('should limit queue to QUEUE_LIMIT own messages', () => {
@@ -878,33 +819,33 @@ describe('Context', function () {
                     replied: 1
                 });
             }
-            const q = ctx._createMsgQ(false);
+            const q = ctx._createMsgQ(null, false);
             const userMsgs = q.filter(m => m.role === 'user');
             expect(userMsgs).to.have.length(5);
             expect(userMsgs[0].content).to.equal('msg 5');
         });
 
-        it('should include only ancestor summaries (not full ancestor messages)', () => {
-            const parentTask = new Itask({ name: 'parent', async: true }, []);
-            const childTask = new Itask({ name: 'child', async: true }, []);
-            parentTask.spawn(childTask);
+        it('QUEUE_LIMIT should not count preamble messages', () => {
+            const ctx = createContext(fakePrompt, null, { queue_limit: 5, min_chat_messages: 0 });
+            for (let i = 0; i < 10; i++) {
+                ctx._msgs.push({
+                    msg: { role: 'user', content: `msg ${i}` },
+                    opts: {},
+                    msgid: `m${i}`,
+                    replied: 1
+                });
+            }
+            const preamble = [
+                { role: 'system', content: 'Prompt 1' },
+                { role: 'system', content: 'Prompt 2' },
+                { role: 'system', content: 'Prompt 3' },
+            ];
+            const q = ctx._createMsgQ(preamble, false);
 
-            const parentCtx = new Context('Parent prompt', parentTask, {});
-            parentTask.setContext(parentCtx);
-
-            // Add a regular message and a summary to parent
-            parentCtx._msgs.push({ msg: { role: 'user', content: 'parent msg' }, opts: {}, msgid: 'pm1', replied: 1 });
-            parentCtx.pushSummary('parent summary');
-
-            const childCtx = createContext(fakePrompt, childTask, {});
-            childTask.setContext(childCtx);
-
-            const q = childCtx._createMsgQ(false);
-
-            // Parent regular message should NOT be in queue
-            expect(q.some(m => m.content === 'parent msg')).to.be.false;
-            // Parent summary SHOULD be in queue
-            expect(q.some(m => m.content && m.content.includes('parent summary'))).to.be.true;
+            // 3 preamble + 5 queue messages = 8 total
+            expect(q).to.have.length(8);
+            const userMsgs = q.filter(m => m.role === 'user');
+            expect(userMsgs).to.have.length(5);
         });
     });
 

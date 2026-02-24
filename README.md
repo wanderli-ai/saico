@@ -1,398 +1,385 @@
-# Saico - Simple AI-agent Conversation Orchestrator
+# Saico - Hierarchical AI Conversation Orchestrator
 
-`Saico` is a minimal yet powerful JavaScript/Node.js library for managing AI conversations with hierarchical context, token-aware summarization, and **enterprise-grade tool calling capabilities**. It's designed to support complex nested conversations while maintaining clean summaries and parent context, making it ideal for AI agents, assistants, and customer support bots.
+Saico is a Node.js library for building AI agents with hierarchical conversations, automatic context aggregation, and enterprise-grade tool calling. It manages nested task trees where each node can have its own conversation context, system prompt, tools, and state — and the library automatically assembles the full payload sent to the LLM by walking the tree.
 
----
+## Features
 
-## ✨ Features
+- **Hierarchical conversations** — Parent-child task trees with automatic prompt, tool, and state summary aggregation
+- **Token-aware summarization** — Automatic summarization when message history approaches token limits
+- **Tool calling** — Depth control, deferred execution, duplicate detection, repetition prevention, and timeout handling
+- **Pluggable storage** — Optional Redis persistence (auto-save via proxy) and pluggable DB backends (DynamoDB adapter included)
+- **Isolation boundaries** — `opt.isolate` stops ancestor aggregation at any node in the tree
+- **Serialization** — Full state save/restore for long-running agents
 
-- 📚 **Hierarchical Conversations** — Track parent-child chat contexts with summary propagation.
-- 🧵 **Scoped Memory** — Manage sub-conversations independently while maintaining parent relevance.
-- 🔁 **Token-Aware Summarization** — Automatically summarize message history based on token thresholds.
-- 💬 **Message-Level Metadata** — Track reply state, summaries, and custom flags.
-- 🛠️ **OpenAI-Compatible Format** — Built for seamless interaction with OpenAI-compatible APIs.
-- 🧰 **Proxy-Based Interface** — Interact with message history like an array, with extra powers.
-- **🚀 NEW: Tool Calls** — Complete tool calling system with depth control, deferred execution, and safety features.
-
----
-
-## 🔧 Tool Calls System
-
-Saico now includes a sophisticated tool calling system with enterprise-grade safety and control features:
-
-### Key Features:
-- **🎛️ Depth Control** — Prevent infinite recursion with configurable depth limits
-- **🔄 Deferred Execution** — Tool calls automatically defer and resume when depth limits reached
-- **🚫 Duplicate Protection** — Identical tool calls blocked while active to prevent resource waste
-- **⏱️ Timeout Handling** — Configurable timeouts (default: 5s) with graceful failure
-- **🔁 Repetition Prevention** — Block excessive repeated tool calls (default: 20 max)
-- **📥 Message Queuing** — Messages automatically queue when tool calls are pending
-- **👨‍👩‍👧‍👦 Parent-Child Inheritance** — Unresponded tool calls move from parent to child contexts
-
----
-
-## 📦 Installation
+## Installation
 
 ```bash
-npm install saico-ai-thread --save
+npm install saico
 ```
 
-Or clone manually:
-
-```bash
-git clone https://github.com/wanderli-ai/saico
-cd saico
-```
-
----
-
-## 🧑‍💻 Usage
-
-### Basic Setup with Tool Handler
+## Quick Start
 
 ```js
-const { createQ } = require('saico');
+const { Saico } = require('saico');
 
-// Define your tool handler
-async function toolHandler(toolName, argumentsString) {
-  const args = JSON.parse(argumentsString);
-  
-  switch (toolName) {
-    case 'get_weather':
-      return `Weather in ${args.location}: 72°F, sunny`;
-    case 'book_hotel':
-      return `Booked ${args.hotel} for ${args.nights} nights`;
-    default:
-      return 'Tool not found';
-  }
-}
-
-// Create conversation with tool support
-const q = createQ(
-  "You are a helpful assistant.",  // prompt
-  null,                            // parent (null for root)
-  "main",                         // tag
-  4000,                           // token limit  
-  null,                           // initial messages
-  toolHandler,                    // tool handler function
-  { max_depth: 5, max_tool_repetition: 20 } // config
-);
-
-// Send a message that might trigger tool calls
-await q.sendMessage('user', 'What\'s the weather in New York?');
-```
-
-### Create a Sub-Conversation with Tool Inheritance
-
-```js
-const subQ = q.spawnChild(
-  "Now focus only on hotel bookings.", // prompt
-  "hotels",                           // tag
-  null,                              // token limit (inherits from parent)
-  null,                              // initial messages
-  null,                              // tool handler (inherits from parent)
-  { max_depth: 3 }                   // custom config
-);
-
-await subQ.sendMessage('user', 'Book me something in Rome.');
-await subQ.close(); // Automatically summarizes and passes back to parent
-```
-
-### Advanced Tool Configuration
-
-```js
-const q = createQ(
-  "You are a travel assistant.",
-  null,
-  "travel",
-  8000,
-  null,
-  toolHandler,
-  {
-    max_depth: 8,              // Allow deeper tool call chains
-    max_tool_repetition: 10    // Be more strict about repetitions
-  }
-);
-
-// Send message with custom tool options
-await q.sendMessage('user', 'Plan my trip', null, {
-  handler: customToolHandler,    // Override default tool handler
-  timeout: 10000,               // 10 second timeout for this message's tools
-  nofunc: false                 // Ensure tool calls are enabled
-});
-```
-
-### Hierarchy Example with Tool Calls
-
-```text
-[Main] (toolHandler: generalTools)
- ├── [hotels] (inherits generalTools) ➜ tool calls + summary returned to [Main]  
- └── [flights] (inherits generalTools) ➜ tool calls + summary returned to [Main]
-```
-
----
-
-## 🧠 Enhanced Message API
-
-Each message is stored with enhanced tool call support:
-
-```js
-{
-  msg: { 
-    role,           // 'user', 'assistant', 'tool', 'system'
-    content,        // Message content
-    name?,          // Optional name for user/tool messages
-    tool_calls?,    // Array of tool calls from assistant
-    tool_call_id?   // ID linking tool responses to calls
-  },
-  opts: { 
-    summary?,       // Is this a summary message?
-    noreply?,       // Skip AI reply for this message
-    nofunc?,        // Disable tool calls for this message  
-    handler?,       // Custom tool handler override
-    timeout?        // Custom timeout for tool calls
-  },
-  msgid: String,    // Unique message identifier
-  replied: 0 | 1 | 3 // 0=pending, 1=user sent, 3=AI replied
-}
-```
-
-### Enhanced API Methods
-
-* `q[0]` — Access nth message
-* `q.length` — Total messages
-* `q.pushSummary(summary)` — Manually inject a summary
-* `q.getMsgContext()` — Get summarized parent chain
-* `q.serialize()` — Export current state
-* **NEW**: `q._hasPendingToolCalls()` — Check for pending tool executions
-* **NEW**: `q._processWaitingQueue()` — Manually process queued messages
-
----
-
-## 🛡️ Tool Call Safety Features
-
-### Depth Control & Deferred Execution
-```js
-const q = createQ("Assistant", null, "main", 4000, null, toolHandler, {
-  max_depth: 3  // Tool calls defer at depth 4+
-});
-
-// When max depth reached:
-// 1. Tool calls are deferred (not executed immediately)
-// 2. Conversation continues normally  
-// 3. Deferred tools execute when depth reduces
-// 4. Results are seamlessly integrated back
-```
-
-### Repetition Prevention
-```js
-const q = createQ("Assistant", null, "main", 4000, null, toolHandler, {
-  max_tool_repetition: 5  // Block tools called >5 times consecutively
-});
-
-// Automatically filters excessive repeated tool calls
-// Logs: "Dropping excessive tool call: get_weather (hit max_tool_repetition=5)"
-```
-
-### Duplicate Detection
-```js
-// If two identical tool calls (same name + arguments) are active:
-// Second call returns: "Duplicate call detected. Please wait for previous call to complete."
-```
-
-### Timeout Handling
-```js
-// Tool calls automatically timeout (default: 5s)
-// Returns: "Tool call 'slow_function' timed out after 5 seconds"
-
-// Custom timeout per message:
-await q.sendMessage('user', 'Run slow analysis', null, { timeout: 30000 });
-```
-
----
-
-## 🧪 Summary Behavior
-
-Summaries trigger when total token count exceeds 85% of the limit and are always triggered when `close()` is called.
-Summaries are:
-
-* Injected as special `[SUMMARY]: ...` messages
-* Bubbled up into the parent context
-* Excluded from re-summarization unless explicitly kept
-* **NEW**: Include tool call results in summarization context
-
----
-
-## 🔄 Redis Integration (Persistent Observable State)
-
-This library includes an optional Redis-based persistence layer to automatically store and update conversation objects (or any JS object) using a **proxy-based observable**.
-
-It supports:
-
-* 🔄 **Auto-saving on change** (with debounce)
-* 🧠 **Selective serialization** (skips internal/private `_` properties)  
-* 🗃️ **Support for serializing `Messages` class**
-* 🔍 **Efficient diff-checking** (saves only when changed)
-* **NEW**: **Tool call state persistence** (active calls, deferred calls, waiting queues)
-
-### 🔧 Setup
-
-1. Install `redis`:
-
-```bash
-npm install redis
-```
-
-2. Initialize Redis:
-
-```js
-const { init, createObservableForRedis } = require('./redis-store');
-await init(); // connects to redis://localhost:6379
-```
-
-3. Wrap a tool-enabled conversation:
-
-```js
-const { createQ } = require('./saico');
-const q = createQ("Travel assistant", null, "flights", 3000, null, toolHandler);
-
-// Wrap with Redis observable - tool states auto-persist
-const obsQ = createObservableForRedis("q:session:12345", q);
-```
-
-Now, any changes to `obsQ` including tool call states, deferred calls, and message queues are **automatically saved** to Redis.
-
----
-
-## 🧼 Auto-Sanitization Rules
-
-When saving to Redis:
-
-* All keys starting with `_` are ignored.
-* Custom `.serialize()` methods (like on `Messages`) are respected.
-* Object updates are **debounced (1s)** and only saved if actual changes are detected.
-* **NEW**: Tool call tracking data is sanitized automatically
-
----
-
-## 🔌 OpenAI Integration
-
-This library supports the modern OpenAI Tools API:
-
-* **NEW**: Native `tool_calls` support (OpenAI's current standard)
-* Backward compatibility with legacy `functions` format
-* Automatic format conversion in openai.js
-* Built-in retry logic with exponential backoff for rate limits
-
-```js
-// OpenAI will return tool_calls in responses:
-{
-  role: 'assistant',
-  content: 'I need to check the weather',
-  tool_calls: [{
-    id: 'call_abc123',
-    type: 'function', 
-    function: {
-      name: 'get_weather',
-      arguments: '{"location": "New York"}'
+class MyAgent extends Saico {
+    constructor() {
+        super({
+            name: 'my-agent',
+            prompt: 'You are a helpful assistant.',
+            tool_handler: (name, args) => this.handleTool(name, args),
+            functions: [{
+                type: 'function',
+                function: {
+                    name: 'get_weather',
+                    description: 'Get weather for a location',
+                    parameters: {
+                        type: 'object',
+                        properties: { location: { type: 'string' } },
+                        required: ['location']
+                    }
+                }
+            }]
+        });
     }
-  }]
+
+    async handleTool(name, argsString) {
+        const args = JSON.parse(argsString);
+        if (name === 'get_weather')
+            return `Weather in ${args.location}: 72F, sunny`;
+        return 'Unknown tool';
+    }
 }
 
-// Saico handles the complete tool execution cycle automatically
+const agent = new MyAgent();
+agent.activate({ createQ: true });
+
+// Backend message (prefixed with [BACKEND] automatically)
+const reply = await agent.sendMessage('What is the weather in Tokyo?');
+
+// User-facing chat message (routed to deepest active context)
+const chatReply = await agent.recvChatMessage('Hello!');
 ```
 
----
+## Core Concepts
 
-## 🧪 Testing
+### Saico Lifecycle
 
-Comprehensive test suite with **37 tests** covering:
+Saico separates construction from activation:
 
-* Core conversation management (25 tests)
-* **NEW**: Tool calls functionality (12 tests):
-  - Basic tool execution
-  - Depth limits and deferred execution
-  - Repetition prevention and filtering
-  - Duplicate detection
-  - Message queuing systems
-  - Timeout handling
-  - Parent-child tool inheritance
+```js
+// 1. Construct — sets up config, Redis proxy, DB access. No task yet.
+const agent = new Saico({
+    name: 'agent',
+    prompt: 'System prompt here',
+    dynamodb_table: 'my_data',  // optional DB
+});
+
+// DB methods work before activation
+const item = await agent.dbGetItem('id', '123');
+
+// 2. Activate — creates internal task + optional message queue context
+agent.activate({ createQ: true });
+
+// 3. Use — send messages, spawn children
+await agent.sendMessage('Do something');
+await agent.recvChatMessage('User says hello');
+
+// 4. Deactivate — bubbles cleaned messages to parent, closes context
+await agent.deactivate();
+```
+
+### Message Orchestration
+
+When `sendMessage()` or `recvChatMessage()` is called, Saico walks the parent chain to build the full LLM payload:
+
+```
+Root Saico (prompt: "You are a manager")
+  +-- Child Saico (prompt: "Handle bookings")
+       +-- Grandchild Saico (prompt: "Process payment")
+            sendMessage("Charge $50")
+                 |
+                 v
+    Preamble built automatically:
+    [Root prompt] [Root state summary] [Root tool digest]
+    [Child prompt] [Child state summary + recent msgs] [Child tool digest]
+    [Grandchild prompt] [Grandchild state summary]
+    ... then the actual message queue messages ...
+
+    Functions aggregated from all levels.
+```
+
+- **`sendMessage(content, functions, opts)`** — Sends a backend message (auto-prefixed `[BACKEND]`). Uses the current or nearest ancestor context.
+- **`recvChatMessage(content, opts)`** — Routes a user chat message DOWN to the deepest descendant with a message queue.
+
+### Isolation
+
+Set `isolate: true` to prevent ancestor aggregation:
+
+```js
+const isolated = new Saico({
+    name: 'isolated-agent',
+    prompt: 'Independent context',
+    isolate: true  // won't include parent prompts/tools/summaries
+});
+```
+
+### State Summaries
+
+Override `getStateSummary()` in your subclass to provide dynamic state context:
+
+```js
+class OrderAgent extends Saico {
+    getStateSummary() {
+        return `Active order: #${this.orderId}, items: ${this.items.length}`;
+    }
+}
+```
+
+When a Saico's context is not the deepest active one, its last 5 user/assistant messages are also included in the state summary automatically.
+
+### Spawning Child Tasks
+
+```js
+// Child with its own conversation context
+const child = agent.spawnTaskWithContext({
+    name: 'subtask',
+    prompt: 'Handle this specific sub-task',
+    tool_handler: (name, args) => handleSubTools(name, args),
+    functions: [/* child-specific tools */]
+}, [
+    async function main() {
+        return await this.sendMessage('Working on subtask...');
+    }
+]);
+
+// Child without context (uses parent's)
+const simple = agent.spawnTask({ name: 'simple' }, [
+    async function main() {
+        await this.sendMessage('Quick operation');
+    }
+]);
+```
+
+Child tasks inherit `sessionConfig` defaults (token_limit, max_depth, etc.) from the parent Saico.
+
+### Deactivation and Message Bubbling
+
+When a Saico deactivates, cleaned messages (no tool calls, no `[BACKEND]` messages) are pushed into the parent's message queue, preserving conversation continuity.
+
+## Constructor Options
+
+```js
+new Saico({
+    // Identity
+    id: 'custom-id',           // Auto-generated if omitted
+    name: 'my-agent',          // Defaults to class name
+
+    // AI config
+    prompt: 'System prompt',
+    tool_handler: fn,          // async (name, argsString) => result
+    functions: [],             // OpenAI function definitions
+
+    // Behavior
+    isolate: false,            // Stop ancestor aggregation
+
+    // Session config (defaults for this agent and its children)
+    token_limit: 4000,
+    max_depth: 5,              // Max tool call recursion depth
+    max_tool_repetition: 20,   // Max consecutive repeated tool calls
+    queue_limit: 100,          // Message queue limit
+    min_chat_messages: 5,      // Min messages to keep in queue
+    sessionConfig: {},         // Override any of the above
+
+    // Storage
+    redis: true,               // Set false to skip Redis proxy
+    key: 'custom-redis-key',
+    dynamodb_table: 'table',   // Auto-creates DynamoDB adapter
+    dynamodb_region: 'us-east-1',
+    db: customAdapter,         // Any adapter with put/get/delete/query interface
+
+    // User data
+    userData: {},              // Arbitrary user metadata
+});
+```
+
+## Activate Options
+
+```js
+agent.activate({
+    createQ: true,             // Create message queue context
+    prompt: 'Extra prompt',    // Appended to class-level prompt
+    states: [],                // Task state functions
+    parent: parentTask,        // Parent task to spawn under
+    taskId: 'custom-id',
+    sequential_mode: true,     // Process messages sequentially
+
+    // Override session config for this activation
+    token_limit: 8000,
+    max_depth: 10,
+    queue_limit: 200,
+});
+```
+
+## User Data
+
+```js
+agent.setUserData('preference', 'dark-mode');  // returns this (chainable)
+agent.getUserData('preference');                // 'dark-mode'
+agent.getUserData();                            // { preference: 'dark-mode' }
+agent.clearUserData();                          // returns this
+```
+
+## Session Info
+
+```js
+agent.getSessionInfo();
+// {
+//   id, name, running, completed,
+//   messageCount, childCount,
+//   userData, uptime
+// }
+
+await agent.closeSession();  // Close context and cancel task
+```
+
+## Database Access
+
+Saico provides backend-agnostic DB methods. Configure via `dynamodb_table` (auto-creates DynamoDB adapter) or `db` (any adapter implementing the interface).
+
+```js
+// CRUD
+await agent.dbPutItem({ id: '123', name: 'test' });
+const item = await agent.dbGetItem('id', '123');
+await agent.dbDeleteItem('id', '123');
+const items = await agent.dbQuery('email-index', 'email', 'user@test.com');
+const all = await agent.dbGetAll();
+
+// Updates
+await agent.dbUpdate('id', '123', 'status', 'active');
+await agent.dbUpdatePath('id', '123', [{ key: 'nested' }], 'field', 'value');
+await agent.dbListAppend('id', '123', 'tags', 'new-tag');
+
+// Counters
+const nextId = await agent.dbNextCounterId('OrderId');
+const count = await agent.dbGetCounterValue('OrderId');
+await agent.dbSetCounterValue('OrderId', 100);
+const total = await agent.dbCountItems();
+```
+
+Override `_deserializeRecord(raw)` to transform raw DB records on retrieval (e.g., restore class instances):
+
+```js
+class MyAgent extends Saico {
+    _deserializeRecord(raw) {
+        if (raw.type === 'order') return new Order(raw);
+        return raw;
+    }
+}
+```
+
+## Serialization
+
+```js
+// Save
+const json = agent.serialize();
+
+// Restore
+const restored = Saico.deserialize(json, {
+    tool_handler: myHandler,
+    functions: myFunctions,
+});
+```
+
+Serialization includes: id, name, prompt, userData, sessionConfig, tm_create, isolate, and full context state (messages, tool_digest, chat_history).
+
+## Redis Persistence
+
+When Redis is initialized, Saico instances are automatically wrapped in an observable proxy. Any property change triggers a debounced save to Redis.
+
+```js
+const { init } = require('saico');
+
+// Initialize with Redis
+await init({ redis: true });
+
+const agent = new Saico({ name: 'persistent-agent' });
+agent.someProperty = 'value';  // Auto-saved to Redis
+```
+
+Properties prefixed with `_` are internal and not persisted.
+
+## Tool Handler Interface
+
+```js
+async function toolHandler(toolName, argumentsString) {
+    const args = JSON.parse(argumentsString);
+    // Execute tool logic
+    return result;  // string or { content: string, functions?: [] }
+}
+```
+
+### Tool Safety Features
+
+- **Depth control** — `max_depth` (default: 5) prevents infinite tool call recursion
+- **Deferred execution** — Tool calls defer when max depth is reached, resume when depth reduces
+- **Duplicate detection** — Identical active tool calls are blocked
+- **Repetition prevention** — `max_tool_repetition` (default: 20) blocks excessive repeated calls
+- **Timeout handling** — Configurable timeout (default: 5s) with graceful failure
+- **Message queuing** — Messages queue automatically when tool calls are pending
+
+## Low-Level API
+
+For cases where you don't need the Saico master class:
+
+```js
+const { createTask, createContext, createQ } = require('saico');
+
+// Create a task with context
+const task = createTask({
+    name: 'my-task',
+    prompt: 'You are helpful',
+    tool_handler: handler,
+    functions: tools
+});
+const reply = await task.sendMessage('Hello');
+
+// Standalone context (legacy)
+const ctx = createQ('System prompt', null, 'tag', 4000, null, handler);
+const reply = await ctx.sendMessage('user', 'Hello', functions);
+```
+
+## Project Structure
+
+```
+saico/
++-- index.js      # Entry point, exports all components
++-- saico.js      # Saico master class
++-- itask.js      # Base task class (hierarchy, states, cancellation)
++-- msgs.js       # Conversation context (message queue, tool calls, summarization)
++-- context.js    # Backward-compat shim for msgs.js
++-- dynamo.js     # DynamoDB storage adapter
++-- store.js      # Storage abstraction (Redis + pluggable backends)
++-- openai.js     # OpenAI API wrapper with retry logic
++-- redis.js      # Redis persistence with observable proxy
++-- util.js       # Utilities (token counting, logging)
+```
+
+## Testing
 
 ```bash
-npm test  # Run full test suite
+npm test
 ```
 
----
+294 tests covering Saico lifecycle, task hierarchy, message handling, tool calls, DB adapters, serialization, and integration flows.
 
-## 📁 Project Structure
+## Requirements
 
-```
-.
-├── saico.js         # Core implementation with tool calls
-├── openai.js        # OpenAI API wrapper with tools support
-├── redis.js         # Saico compatible redis wrapper  
-├── util.js          # Utilities: token counting, etc.
-├── test.js          # Comprehensive test suite
-├── msgs.js          # Original enhanced version (reference)
-└── README.md        # This file
-```
+- Node.js >= 16.0.0
+- `OPENAI_API_KEY` environment variable for LLM calls
+- Redis (optional, for auto-persistence)
+- AWS SDK v3 (optional peer dependency, for DynamoDB)
 
----
+## License
 
-## 🚀 Migration Guide
-
-If upgrading from older versions:
-
-### Old API:
-```js
-const q = createQ(prompt, opts, msgs, parent);
-```
-
-### New API:  
-```js
-const q = createQ(prompt, parent, tag, token_limit, msgs, tool_handler, config);
-```
-
-### Breaking Changes:
-- Constructor parameter order changed
-- `opts.tag` → `tag` parameter
-- `opts.token_limit` → `token_limit` parameter  
-- Added `tool_handler` and `config` parameters
-- `function_call` → `tool_calls` in OpenAI responses
-
----
-
-## 🔐 License
-
-MIT License © [Wanderli.ai]
-
----
-
-## 🙌 Contributing
-
-Pull requests, issues, and suggestions welcome! Please fork the repo and open a PR, or submit issues directly.
-
-Areas where contributions are especially welcome:
-- Additional tool call safety features
-- Performance optimizations for large conversations
-- Extended test coverage
-- Documentation improvements
-
----
-
-## 📣 Acknowledgements
-
-This project was inspired by the need for a lightweight, non-opinionated alternative to LangChain's memory modules, with full support for real-world LLM conversation flows and enterprise-grade tool calling capabilities.
-
----
-
-## 🔮 Roadmap
-
-- [ ] **Multi-model support** (Anthropic, Google, etc.)
-- [ ] **Advanced tool call analytics** and monitoring
-- [ ] **Custom summarization strategies** 
-- [ ] **Tool call result caching**
-- [ ] **Streaming tool call responses**
-- [ ] **Tool call permission systems**
-
-Let me know if you'd like to see any of these features prioritized!
+ISC

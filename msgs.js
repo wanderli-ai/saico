@@ -69,39 +69,6 @@ class Context {
             this.functions = task?.functions;
     }
 
-    // Overridable: extending classes provide current state summary
-    getStateSummary() { return ''; }
-
-    // Recursively collect state summaries from child tasks that have no context
-    // (no msg Q), stopping at children that do have one.
-    _collectChildStateSummaries(task) {
-        if (!task.child || !task.child.size) return '';
-        const parts = [];
-        for (const child of task.child) {
-            if (child.context) continue; // has its own Q — boundary, stop here
-            if (typeof child.getStateSummary === 'function') {
-                const s = child.getStateSummary();
-                if (s) parts.push(s);
-            }
-            const nested = this._collectChildStateSummaries(child);
-            if (nested) parts.push(nested);
-        }
-        return parts.join('\n');
-    }
-
-    // Internal (not overridable): own getStateSummary() + summaries from all
-    // contextless descendants, stopping at the first child that has its own Q.
-    _getStateSummary() {
-        const parts = [];
-        const own = this.getStateSummary();
-        if (own) parts.push(own);
-        if (this.task) {
-            const childSummaries = this._collectChildStateSummaries(this.task);
-            if (childSummaries) parts.push(childSummaries);
-        }
-        return parts.join('\n');
-    }
-
     // Snapshot all public (non-underscore) task properties for dirty detection.
     // Mirrors the observable proxy convention: _ prefix = internal, ignored.
     // Does NOT call serialize() — that is for persistence, not dirty detection.
@@ -822,52 +789,31 @@ class Context {
         return msgs.slice(startIdx);
     }
 
-    // Build message queue — layered structure:
-    //   Layer 1: System prompts from ancestor hierarchy + own prompt (transient)
-    //   Layer 2: [State Summary] from getStateSummary() override (transient, if non-empty)
-    //   Layer 3: [Tool Activity Log] from tool_digest (transient, if non-empty)
-    //   Layer 4: Ancestor summaries only + last QUEUE_LIMIT of own messages (persistent)
-    _createMsgQ(add_tag, tag_filter) {
-        const fullQueue = [];
-        const ancestorContexts = this.getAncestorContexts();
+    // Build message queue.
+    // When preamble is provided (by Saico orchestrator), it is prepended as-is
+    // and does NOT count against QUEUE_LIMIT. Otherwise falls back to standalone
+    // behavior: own prompt + tool digest + own messages.
+    _createMsgQ(preamble, add_tag, tag_filter) {
+        const fullQueue = [...(preamble || [])];
 
-        // Layer 1+2: Each level's prompt followed immediately by its state summary
-        for (const ctx of ancestorContexts) {
-            if (ctx.prompt) {
-                const prompt = {role: 'system', content: ctx.prompt};
-                if (add_tag) prompt.tag = ctx.tag;
+        // Standalone fallback — when no preamble provided, add own prompt/digest
+        if (!preamble) {
+            if (this.prompt) {
+                const prompt = {role: 'system', content: this.prompt};
+                if (add_tag) prompt.tag = this.tag;
                 fullQueue.push(prompt);
             }
-            const ctxSummary = ctx._getStateSummary();
-            if (ctxSummary)
-                fullQueue.push({role: 'system', content: '[State Summary]\n' + ctxSummary});
-        }
-        if (this.prompt) {
-            const prompt = {role: 'system', content: this.prompt};
-            if (add_tag) prompt.tag = this.tag;
-            fullQueue.push(prompt);
-        }
-        const stateSummary = this._getStateSummary();
-        if (stateSummary)
-            fullQueue.push({role: 'system', content: '[State Summary]\n' + stateSummary});
 
-        // Layer 3: Tool digest (if non-empty)
-        if (this.tool_digest.length > 0) {
-            const digestText = this.tool_digest.map(entry =>
-                `[${new Date(entry.tm).toISOString()}] ${entry.tool}: ${entry.result}`
-            ).join('\n');
-            fullQueue.push({role: 'system', content: '[Tool Activity Log]\n' + digestText});
-        }
-
-        // Layer 4: Ancestor summaries only (no full ancestor messages)
-        for (const ctx of ancestorContexts) {
-            const summaries = ctx._msgs
-                .filter(m => m.opts.summary)
-                .map(m => add_tag ? Object.assign({}, m.msg, {tag: ctx.tag}) : m.msg);
-            fullQueue.push(...summaries);
+            if (this.tool_digest.length > 0) {
+                const digestText = this.tool_digest.map(entry =>
+                    `[${new Date(entry.tm).toISOString()}] ${entry.tool}: ${entry.result}`
+                ).join('\n');
+                fullQueue.push({role: 'system', content: '[Tool Activity Log]\n' + digestText});
+            }
         }
 
         // Own messages — filter by tag if requested, then slice to QUEUE_LIMIT
+        // QUEUE_LIMIT only applies here — preamble is not counted
         let my_msgs;
         if (tag_filter !== undefined) {
             my_msgs = this._msgs.filter(m => {
@@ -948,7 +894,7 @@ class Context {
     _debugQDump(Q, functions) {
         if (util.is_mocha && process.env.PROD)
             return;
-        const dbgQ = Q || this._createMsgQ(true);
+        const dbgQ = Q || this._createMsgQ(null, true);
         if (debug) {
             console.log('MSGQDEBUG - Q:', JSON.stringify(dbgQ.map(m => ({
                 role: m.role,
@@ -973,14 +919,22 @@ class Context {
                 this._processWaitingQueue();
             }
 
-            Q = this._createMsgQ(false, o.opts?.tag);
+            Q = this._createMsgQ(o.opts?._preamble, false, o.opts?.tag);
 
-            // Aggregate functions from hierarchy and merge with message-specific functions
-            const hierarchyFuncs = this.getFunctions() || [];
-            const messageFuncs = o.functions || [];
-            const funcs = [...hierarchyFuncs, ...messageFuncs].length > 0
-                ? [...hierarchyFuncs, ...messageFuncs]
-                : null;
+            // Use aggregated functions from Saico if provided, else fall back to own
+            let funcs;
+            if (o.opts?._aggregatedFunctions) {
+                const messageFuncs = o.functions || [];
+                funcs = [...o.opts._aggregatedFunctions, ...messageFuncs].length > 0
+                    ? [...o.opts._aggregatedFunctions, ...messageFuncs]
+                    : null;
+            } else {
+                const hierarchyFuncs = this.getFunctions() || [];
+                const messageFuncs = o.functions || [];
+                funcs = [...hierarchyFuncs, ...messageFuncs].length > 0
+                    ? [...hierarchyFuncs, ...messageFuncs]
+                    : null;
+            }
 
             if (debug)
                 this._debugQDump(Q, funcs);

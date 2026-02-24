@@ -746,9 +746,22 @@ Itask.prototype.closeContext = async function closeContext(){
     await this.context.close();
 };
 
-// Overridable: contextless tasks can provide a state summary that bubbles up
-// into the nearest ancestor context's _getStateSummary().
-Itask.prototype.getStateSummary = function getStateSummary(){ return ''; };
+// Walk DOWN to find the deepest active descendant with a context
+Itask.prototype.findDeepestContext = function findDeepestContext() {
+    let deepest = this.context ? { context: this.context, depth: 0 } : null;
+    const search = (task, depth) => {
+        for (const child of task.child) {
+            if (child._completed) continue;
+            if (child.context) {
+                if (!deepest || depth + 1 >= deepest.depth)
+                    deepest = { context: child.context, depth: depth + 1 };
+            }
+            search(child, depth + 1);
+        }
+    };
+    search(this, 0);
+    return deepest ? deepest.context : null;
+};
 
 // Reference to Context class (set by index.js to avoid circular dependency)
 Itask.Context = null;

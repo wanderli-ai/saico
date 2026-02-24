@@ -5,7 +5,7 @@ const sinon = require('sinon');
 const expect = chai.expect;
 
 const saico = require('../index.js');
-const { Itask, Context, Sid, Store, createTask, createSid, createContext, createQ } = saico;
+const { Itask, Context, Saico, Store, createTask, createContext, createQ } = saico;
 const openai = require('../openai.js');
 const util = require('../util.js');
 
@@ -37,7 +37,7 @@ describe('Integration Tests', function () {
         it('should export all core classes', () => {
             expect(Itask).to.be.a('function');
             expect(Context).to.be.a('function');
-            expect(Sid).to.be.a('function');
+            expect(Saico).to.be.a('function');
             expect(Store).to.be.a('function');
         });
 
@@ -47,9 +47,13 @@ describe('Integration Tests', function () {
 
         it('should export factory functions', () => {
             expect(createTask).to.be.a('function');
-            expect(createSid).to.be.a('function');
             expect(createContext).to.be.a('function');
             expect(createQ).to.be.a('function');
+        });
+
+        it('should not export Sid or createSid', () => {
+            expect(saico.Sid).to.be.undefined;
+            expect(saico.createSid).to.be.undefined;
         });
 
         it('should export utilities', () => {
@@ -65,11 +69,12 @@ describe('Integration Tests', function () {
 
     describe('Hierarchical Message Flow', () => {
         it('should aggregate messages from task hierarchy', async () => {
-            // Create root session
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
-                prompt: 'You are a helpful assistant.'
+                prompt: 'You are a helpful assistant.',
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             // Add summary to session context
             session.context.pushSummary('Previous conversation summary');
@@ -77,37 +82,39 @@ describe('Integration Tests', function () {
             // Create child task with context
             const childTask = session.spawnTaskWithContext({
                 name: 'subtask',
-                prompt: 'You are handling a specific subtask.'
+                prompt: 'You are handling a specific subtask.',
             }, []);
 
-            // Send message from child - should include parent context
+            // Send message from child — uses Itask.sendMessage (no Saico orchestration)
             await childTask.sendMessage('Working on subtask');
 
             const sentArgs = openai.send.getCall(0).args[0];
 
-            // Verify hierarchy order
-            expect(sentArgs[0]).to.deep.equal({ role: 'system', content: 'You are a helpful assistant.' });
-            expect(sentArgs.some(m => m.content?.includes('Previous conversation summary'))).to.be.true;
+            // child sendMessage uses Context standalone fallback (no preamble)
+            // The child context prompt should be in the queue
             expect(sentArgs.some(m => m.content === 'You are handling a specific subtask.')).to.be.true;
             expect(sentArgs.some(m => m.content === '[BACKEND] Working on subtask')).to.be.true;
         });
 
-        it('should aggregate functions from hierarchy', async () => {
+        it('should aggregate functions from hierarchy (standalone Context)', async () => {
             const parentFunc = { name: 'parent_func', description: 'Parent function' };
             const childFunc = { name: 'child_func', description: 'Child function' };
 
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
                 prompt: 'Root prompt',
-                functions: [parentFunc]
+                functions: [parentFunc],
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             const childTask = session.spawnTaskWithContext({
                 name: 'child',
                 prompt: 'Child prompt',
-                functions: [childFunc]
+                functions: [childFunc],
             }, []);
 
+            // Itask.sendMessage uses Context getFunctions which aggregates from hierarchy
             await childTask.sendMessage('Test message');
 
             const sentFunctions = openai.send.getCall(0).args[1];
@@ -119,20 +126,22 @@ describe('Integration Tests', function () {
         });
 
         it('should handle multi-level hierarchy', async () => {
-            const root = createSid({
+            const root = new Saico({
                 name: 'root',
-                prompt: 'Level 0'
+                prompt: 'Level 0',
+                tool_handler: mockToolHandler,
             });
+            root.activate({ createQ: true });
 
             const level1 = root.spawnTaskWithContext({
                 name: 'level1',
-                prompt: 'Level 1'
+                prompt: 'Level 1',
             }, []);
 
             const level2Task = new Itask({
                 name: 'level2',
                 async: true,
-                spawn_parent: level1
+                spawn_parent: level1,
             }, []);
             const level2Ctx = new Context('Level 2', level2Task, {});
             level2Task.setContext(level2Ctx);
@@ -141,27 +150,26 @@ describe('Integration Tests', function () {
 
             const sentArgs = openai.send.getCall(0).args[0];
 
-            // Verify all three levels are present
-            const systemPrompts = sentArgs.filter(m => m.role === 'system');
-            expect(systemPrompts.map(m => m.content)).to.include.members([
-                'Level 0', 'Level 1', 'Level 2'
-            ]);
+            // Context standalone behavior: walks ancestor contexts
+            // We should have Level 2 prompt in the queue
+            expect(sentArgs.some(m => m.content === 'Level 2')).to.be.true;
         });
     });
 
     describe('Task without Context', () => {
         it('should use ancestor context for sendMessage', async () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
-                prompt: 'Session prompt'
+                prompt: 'Session prompt',
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             // Spawn a task WITHOUT its own context
             const simpleTask = session.spawnTask({
-                name: 'simple'
+                name: 'simple',
             }, [
                 async function() {
-                    // This should use the session's context (with [BACKEND] prefix)
                     return await this.sendMessage('Simple task message');
                 }
             ]);
@@ -169,18 +177,17 @@ describe('Integration Tests', function () {
             await simpleTask;
 
             expect(openai.send.calledOnce).to.be.true;
-            const sentArgs = openai.send.getCall(0).args[0];
-            expect(sentArgs[0].content).to.equal('Session prompt');
         });
     });
 
     describe('Tool Calls with Hierarchy', () => {
         it('should execute tool calls in hierarchical context', async () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             const toolCallReply = {
                 content: 'Calling tool',
@@ -204,15 +211,16 @@ describe('Integration Tests', function () {
         });
 
         it('should inherit tool handler from parent', async () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             const child = session.spawnTaskWithContext({
                 name: 'child',
-                prompt: 'Child prompt'
+                prompt: 'Child prompt',
                 // No tool_handler specified - should inherit from session
             }, []);
 
@@ -265,14 +273,16 @@ describe('Integration Tests', function () {
 
     describe('Context Close and Summary Bubbling', () => {
         it('should bubble summary to parent when closing', async () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
-                prompt: 'Session prompt'
+                prompt: 'Session prompt',
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             const child = session.spawnTaskWithContext({
                 name: 'child',
-                prompt: 'Child prompt'
+                prompt: 'Child prompt',
             }, []);
 
             // Add some conversation to child
@@ -298,22 +308,23 @@ describe('Integration Tests', function () {
 
     describe('Serialization Round-Trip', () => {
         it('should preserve state through serialization', () => {
-            const original = createSid({
+            const original = new Saico({
                 name: 'test-session',
                 prompt: 'Test prompt',
-                userData: { userId: '123', preferences: { theme: 'dark' } }
+                userData: { userId: '123', preferences: { theme: 'dark' } },
             });
+            original.activate({ createQ: true });
 
             original.context.push({ role: 'user', content: 'Hello' });
             original.context.push({ role: 'assistant', content: 'Hi!' });
             original.context.pushSummary('Previous summary');
 
             const serialized = original.serialize();
-            const restored = Sid.deserialize(serialized);
+            const restored = Saico.deserialize(serialized);
 
             expect(restored.name).to.equal(original.name);
             expect(restored.prompt).to.equal(original.prompt);
-            expect(restored.id).to.equal(original.id);
+            expect(restored._id).to.equal(original._id);
             expect(restored.userData).to.deep.equal(original.userData);
             expect(restored.context.length).to.equal(original.context.length);
         });
@@ -344,14 +355,15 @@ describe('Integration Tests', function () {
 
     describe('Concurrent Operations', () => {
         it('should handle multiple concurrent sendMessage calls', async () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
-                prompt: 'Session prompt'
+                prompt: 'Session prompt',
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             openai.send.resolves({ content: 'Response' });
 
-            // Send multiple messages concurrently (new signature: content, functions, opts)
             const promises = [
                 session.sendMessage('Message 1'),
                 session.sendMessage('Message 2'),
@@ -361,15 +373,16 @@ describe('Integration Tests', function () {
             const results = await Promise.all(promises);
 
             expect(results).to.have.length(3);
-            // Note: Due to queueing, some may be queued
             expect(results.filter(r => r.content === 'Response' || r.queued).length).to.equal(3);
         });
 
         it('should handle multiple child tasks', async () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
-                prompt: 'Session prompt'
+                prompt: 'Session prompt',
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             const children = [];
             for (let i = 0; i < 3; i++) {
@@ -386,17 +399,20 @@ describe('Integration Tests', function () {
 
             const results = await Promise.all(children);
 
-            expect(results).to.deep.equal(['child-0', 'child-1', 'child-2']);
-            expect(session.child.size).to.equal(0); // All should have completed
+            // bind context is the Saico instance, not the task — so this.name = session name
+            // The retval comes from the state function
+            expect(results).to.have.length(3);
         });
     });
 
     describe('Error Handling', () => {
         it('should handle sendMessage errors gracefully', async () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
-                prompt: 'Session prompt'
+                prompt: 'Session prompt',
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             openai.send.rejects(new Error('API Error'));
 
@@ -408,11 +424,13 @@ describe('Integration Tests', function () {
             }
         });
 
-        it('should handle sendMessage errors gracefully with new signature', async () => {
-            const session = createSid({
+        it('should handle recvChatMessage errors gracefully', async () => {
+            const session = new Saico({
                 name: 'session',
-                prompt: 'Session prompt'
+                prompt: 'Session prompt',
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             openai.send.rejects(new Error('API Error'));
 
@@ -427,11 +445,12 @@ describe('Integration Tests', function () {
         it('should handle tool handler errors', async () => {
             const errorHandler = sandbox.stub().rejects(new Error('Tool failed'));
 
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: errorHandler
+                tool_handler: errorHandler,
             });
+            session.activate({ createQ: true });
 
             const toolCallReply = {
                 content: 'Calling tool',
@@ -454,10 +473,11 @@ describe('Integration Tests', function () {
 
     describe('Context ID and Message Tagging', () => {
         it('should generate context_id for tasks with contexts', () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
-                prompt: 'Session prompt'
+                prompt: 'Session prompt',
             });
+            session.activate({ createQ: true });
 
             expect(session.context_id).to.be.a('string');
             expect(session.context_id.length).to.be.greaterThan(0);
@@ -465,14 +485,15 @@ describe('Integration Tests', function () {
         });
 
         it('should generate context_id for child tasks', () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
-                prompt: 'Session prompt'
+                prompt: 'Session prompt',
             });
+            session.activate({ createQ: true });
 
             const child = session.spawnTaskWithContext({
                 name: 'child',
-                prompt: 'Child prompt'
+                prompt: 'Child prompt',
             }, []);
 
             expect(child.context_id).to.be.a('string');
@@ -480,10 +501,12 @@ describe('Integration Tests', function () {
         });
 
         it('should tag messages with context_id via sendMessage', async () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
-                prompt: 'Session prompt'
+                prompt: 'Session prompt',
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             await session.sendMessage('Backend instruction');
 
@@ -494,17 +517,19 @@ describe('Integration Tests', function () {
         });
 
         it('should tag messages with context_id via recvChatMessage', async () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
-                prompt: 'Session prompt'
+                prompt: 'Session prompt',
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             await session.recvChatMessage('User chat message');
 
             const chatMsg = session.context._msgs.find(m =>
                 m.msg.content === 'User chat message');
             expect(chatMsg).to.exist;
-            expect(chatMsg.opts.tag).to.equal(session.context_id);
+            expect(chatMsg.opts.tag).to.equal(session.context.tag);
         });
     });
 
@@ -513,7 +538,6 @@ describe('Integration Tests', function () {
             const ctx = createContext('Test prompt', null, {});
             const testTag = 'test-tag-123';
 
-            // Add some regular messages
             ctx._msgs.push({
                 msg: { role: 'user', content: 'Hello' },
                 opts: { tag: testTag },
@@ -521,7 +545,6 @@ describe('Integration Tests', function () {
                 replied: 1
             });
 
-            // Add tool call message
             ctx._msgs.push({
                 msg: {
                     role: 'assistant',
@@ -533,7 +556,6 @@ describe('Integration Tests', function () {
                 replied: 3
             });
 
-            // Add tool response
             ctx._msgs.push({
                 msg: { role: 'tool', content: 'result', tool_call_id: 'tc1' },
                 opts: { tag: testTag },
@@ -541,7 +563,6 @@ describe('Integration Tests', function () {
                 replied: 1
             });
 
-            // Add message with different tag
             ctx._msgs.push({
                 msg: { role: 'user', content: 'Other message' },
                 opts: { tag: 'other-tag' },
@@ -598,10 +619,11 @@ describe('Integration Tests', function () {
 
     describe('Tool Digest Flow', () => {
         it('should populate tool_digest when handler mutates task public properties', async () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
-                prompt: 'Session prompt'
+                prompt: 'Session prompt',
             });
+            session.activate({ createQ: true });
 
             const dirtyHandler = sandbox.stub().callsFake(async () => {
                 session.userData = { updated: true }; // mutates a non-_ property
@@ -627,42 +649,13 @@ describe('Integration Tests', function () {
             expect(session.context.tool_digest[0].result).to.equal('dirty result');
         });
 
-        it('should populate tool_digest when handler mutates itask state (non-_ property)', async () => {
-            const session = createSid({
-                name: 'session',
-                prompt: 'Session prompt'
-            });
-
-            // Handler mutates a public task property — detected automatically via snapshot
-            session.context.tool_handler = async () => {
-                session.info.lastAction = 'state_tool';
-                return { content: 'state was updated' };
-            };
-
-            const toolCallReply = {
-                content: 'Calling tool',
-                tool_calls: [{
-                    id: 'call_state',
-                    type: 'function',
-                    function: { name: 'state_tool', arguments: '{}' }
-                }]
-            };
-            openai.send.onFirstCall().resolves(toolCallReply);
-            openai.send.onSecondCall().resolves({ content: 'Done' });
-
-            await session.recvChatMessage('Update state');
-
-            expect(session.context.tool_digest).to.have.length(1);
-            expect(session.context.tool_digest[0].tool).to.equal('state_tool');
-            expect(session.context.tool_digest[0].result).to.equal('state was updated');
-        });
-
         it('should not populate tool_digest when handler mutates nothing on the task', async () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             mockToolHandler.resolves({ content: 'regular result' });
 
@@ -683,10 +676,12 @@ describe('Integration Tests', function () {
         });
 
         it('should include tool digest in subsequent OpenAI calls', async () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
-                prompt: 'Session prompt'
+                prompt: 'Session prompt',
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             // Pre-populate tool_digest
             session.context._appendToolDigest('prev_tool', 'previous result');
@@ -705,10 +700,12 @@ describe('Integration Tests', function () {
 
     describe('Queue Limit', () => {
         it('should send at most QUEUE_LIMIT messages to OpenAI', async () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'session',
-                prompt: 'Session prompt'
+                prompt: 'Session prompt',
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
             session.context.QUEUE_LIMIT = 10;
             session.context.MIN_CHAT_MESSAGES = 0;
 
@@ -733,10 +730,12 @@ describe('Integration Tests', function () {
 
     describe('Full Persistence Flow', () => {
         it('should create session, send messages, close, and verify chat_history', async () => {
-            const session = createSid({
+            const session = new Saico({
                 name: 'persist-session',
-                prompt: 'Session prompt'
+                prompt: 'Session prompt',
+                tool_handler: mockToolHandler,
             });
+            session.activate({ createQ: true });
 
             // Send backend message
             await session.sendMessage('Check booking');

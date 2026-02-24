@@ -12,15 +12,14 @@
  * - Storage persistence (Redis cache + optional DB backend)
  *
  * Main Components:
+ * - Saico: Master class (external users extend this)
  * - Itask: Base task class for all tasks (supports states, cancellation, promises)
  * - Context: Conversation context with message handling and tool calls
- * - Sid: Session root task (extends Itask, always has a context)
  * - Store: Storage abstraction layer (Redis + optional backends like DynamoDB)
  */
 
 const Itask = require('./itask.js');
 const { Context, createContext } = require('./msgs.js');
-const { Sid, createSid } = require('./sid.js');
 const { Store, DynamoBackend } = require('./store.js');
 const { Saico } = require('./saico.js');
 const { DynamoDBAdapter } = require('./dynamo.js');
@@ -144,7 +143,6 @@ module.exports = {
     // Core classes
     Itask,
     Context,
-    Sid,
     Store,
     DynamoBackend,
 
@@ -153,7 +151,6 @@ module.exports = {
 
     // Factory functions
     createTask,
-    createSid,
     createContext,
 
     // Legacy compatibility

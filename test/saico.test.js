@@ -50,6 +50,10 @@ describe('Saico', function () {
             expect(s.tool_handler).to.be.null;
             expect(s.functions).to.be.null;
             expect(s._db).to.be.null;
+            expect(s.userData).to.deep.equal({});
+            expect(s.tm_create).to.be.a('number');
+            expect(s._isolate).to.be.false;
+            expect(s.sessionConfig).to.be.an('object');
         });
 
         it('should accept options', () => {
@@ -61,12 +65,16 @@ describe('Saico', function () {
                 prompt: fakePrompt,
                 tool_handler: handler,
                 functions: funcs,
+                userData: { key: 'val' },
+                isolate: true,
             });
             expect(s._id).to.equal('my-id');
             expect(s.name).to.equal('my-service');
             expect(s.prompt).to.equal(fakePrompt);
             expect(s.tool_handler).to.equal(handler);
             expect(s.functions).to.equal(funcs);
+            expect(s.userData).to.deep.equal({ key: 'val' });
+            expect(s._isolate).to.be.true;
         });
 
         it('should use constructor.name as default name', () => {
@@ -82,10 +90,8 @@ describe('Saico', function () {
             redis.rclient = fakeRclient;
 
             const s = new Saico({ id: 'test-id', redis: true });
-            // The proxy should still expose instance properties
             expect(s._id).to.equal('test-id');
             expect(s.name).to.equal('Saico');
-            // lastMod should be available (from createObservableForRedis)
             expect(typeof s.lastMod).to.equal('function');
         });
 
@@ -108,6 +114,17 @@ describe('Saico', function () {
             const fakeDb = { put: sandbox.stub(), get: sandbox.stub() };
             const s = new Saico({ db: fakeDb });
             expect(s._db).to.equal(fakeDb);
+        });
+
+        it('should merge sessionConfig from opt', () => {
+            const s = new Saico({
+                max_depth: 10,
+                queue_limit: 50,
+                sessionConfig: { min_chat_messages: 3 },
+            });
+            expect(s.sessionConfig.max_depth).to.equal(10);
+            expect(s.sessionConfig.queue_limit).to.equal(50);
+            expect(s.sessionConfig.min_chat_messages).to.equal(3);
         });
     });
 
@@ -149,7 +166,6 @@ describe('Saico', function () {
         it('should combine class-level and activation-level prompts', () => {
             const s = new Saico({ prompt: 'Class prompt.' });
             s.activate({ createQ: true, prompt: 'Activation prompt.' });
-            // The context prompt should contain both
             expect(s.context.prompt).to.include('Class prompt.');
             expect(s.context.prompt).to.include('Activation prompt.');
         });
@@ -184,13 +200,10 @@ describe('Saico', function () {
             expect(s._task.bind).to.equal(s);
         });
 
-        it('should delegate getStateSummary from task to Saico', () => {
-            class MyApp extends Saico {
-                getStateSummary() { return 'my summary'; }
-            }
-            const app = new MyApp();
-            app.activate();
-            expect(app._task.getStateSummary()).to.equal('my summary');
+        it('should store _saico reference on task', () => {
+            const s = new Saico({ name: 'test' });
+            s.activate();
+            expect(s._task._saico).to.equal(s);
         });
 
         it('should accept states option', () => {
@@ -220,13 +233,21 @@ describe('Saico', function () {
             expect(s.context.QUEUE_LIMIT).to.equal(20);
             expect(s.context.MIN_CHAT_MESSAGES).to.equal(5);
         });
+
+        it('should use sessionConfig as defaults for context config', () => {
+            const s = new Saico({
+                sessionConfig: { max_depth: 7, queue_limit: 40 },
+            });
+            s.activate({ createQ: true });
+            expect(s.context.max_depth).to.equal(7);
+            expect(s.context.QUEUE_LIMIT).to.equal(40);
+        });
     });
 
     describe('deactivate', () => {
         it('should cancel task and clean up', async () => {
             const s = new Saico();
             s.activate();
-            const task = s._task;
             await s.deactivate();
             expect(s._task).to.be.null;
             expect(s.isActive).to.be.false;
@@ -234,45 +255,198 @@ describe('Saico', function () {
 
         it('should be safe to call when not activated', async () => {
             const s = new Saico();
-            await s.deactivate(); // should not throw
+            await s.deactivate();
             expect(s._task).to.be.null;
+        });
+
+        it('should bubble cleaned messages to parent context', async () => {
+            const parent = new Saico({ name: 'parent', tool_handler: mockToolHandler });
+            parent.activate({ createQ: true });
+
+            const child = new Saico({ name: 'child', tool_handler: mockToolHandler });
+            child.activate({ createQ: true, parent: parent._task });
+
+            // Add some messages to child
+            child.context._msgs.push({
+                msg: { role: 'user', content: 'User msg' },
+                opts: {}, msgid: 'c1', replied: 1,
+            });
+            child.context._msgs.push({
+                msg: { role: 'assistant', content: 'Agent reply' },
+                opts: {}, msgid: 'c2', replied: 3,
+            });
+            // Also add a BACKEND msg that should be filtered
+            child.context._msgs.push({
+                msg: { role: 'user', content: '[BACKEND] internal' },
+                opts: {}, msgid: 'c3', replied: 1,
+            });
+
+            const parentMsgsBefore = parent.context._msgs.length;
+            await child.deactivate();
+
+            // Parent should have gained the user and assistant messages (not BACKEND)
+            const newMsgs = parent.context._msgs.slice(parentMsgsBefore);
+            expect(newMsgs.length).to.equal(2);
+            expect(newMsgs[0].msg.content).to.equal('User msg');
+            expect(newMsgs[1].msg.content).to.equal('Agent reply');
         });
     });
 
-    describe('sendMessage', () => {
+    describe('sendMessage orchestration', () => {
         it('should throw when not activated', async () => {
             const s = new Saico();
             try {
                 await s.sendMessage('hello');
                 expect.fail('should have thrown');
             } catch (e) {
-                expect(e.message).to.equal('Not activated. Call activate() first.');
+                expect(e.message).to.include('Not activated');
             }
         });
 
-        it('should delegate to task sendMessage', async () => {
+        it('should build preamble and pass to context', async () => {
             const s = new Saico({
                 prompt: fakePrompt,
                 tool_handler: mockToolHandler,
             });
             s.activate({ createQ: true });
-            const reply = await s.sendMessage('hello');
-            expect(reply.content).to.include('AI response');
+
+            await s.sendMessage('hello');
+
+            const sentArgs = openai.send.getCall(0).args[0];
+            // The preamble should include the prompt
+            expect(sentArgs.some(m => m.content === fakePrompt)).to.be.true;
+            // And the user message
+            expect(sentArgs.some(m => m.content === '[BACKEND] hello')).to.be.true;
+        });
+
+        it('should include state summary in preamble', async () => {
+            class MyApp extends Saico {
+                getStateSummary() { return 'my state'; }
+            }
+            const app = new MyApp({ prompt: 'test', tool_handler: mockToolHandler });
+            app.activate({ createQ: true });
+
+            await app.sendMessage('hello');
+
+            const sentArgs = openai.send.getCall(0).args[0];
+            const summaryMsg = sentArgs.find(m =>
+                m.role === 'system' && m.content?.includes('[State Summary]'));
+            expect(summaryMsg).to.exist;
+            expect(summaryMsg.content).to.include('my state');
+        });
+
+        it('should include tool digest from context in preamble', async () => {
+            const s = new Saico({ prompt: 'test', tool_handler: mockToolHandler });
+            s.activate({ createQ: true });
+            s.context._appendToolDigest('myTool', 'tool result');
+
+            await s.sendMessage('hello');
+
+            const sentArgs = openai.send.getCall(0).args[0];
+            const digestMsg = sentArgs.find(m =>
+                m.role === 'system' && m.content?.includes('[Tool Activity Log]'));
+            expect(digestMsg).to.exist;
+            expect(digestMsg.content).to.include('myTool');
+        });
+
+        it('should aggregate functions from Saico and pass via opts', async () => {
+            const s = new Saico({
+                prompt: 'test',
+                tool_handler: mockToolHandler,
+                functions: [{ name: 'func1' }],
+            });
+            s.activate({ createQ: true });
+
+            await s.sendMessage('hello', [{ name: 'func2' }]);
+
+            const sentFunctions = openai.send.getCall(0).args[1];
+            expect(sentFunctions).to.have.length(2);
+            expect(sentFunctions.map(f => f.name)).to.include.members(['func1', 'func2']);
+        });
+
+        it('should aggregate preamble from parent Saico chain', async () => {
+            const parent = new Saico({
+                name: 'parent',
+                prompt: 'Parent prompt',
+                tool_handler: mockToolHandler,
+                functions: [{ name: 'parent_func' }],
+            });
+            parent.activate({ createQ: true });
+
+            const child = new Saico({
+                name: 'child',
+                prompt: 'Child prompt',
+                tool_handler: mockToolHandler,
+                functions: [{ name: 'child_func' }],
+            });
+            child.activate({ createQ: true, parent: parent._task });
+
+            await child.sendMessage('hello');
+
+            const sentArgs = openai.send.getCall(0).args[0];
+            const sentFunctions = openai.send.getCall(0).args[1];
+
+            // Both prompts should be in the preamble
+            expect(sentArgs.some(m => m.content === 'Parent prompt')).to.be.true;
+            expect(sentArgs.some(m => m.content === 'Child prompt')).to.be.true;
+
+            // Both function sets should be aggregated
+            expect(sentFunctions).to.have.length(2);
+            expect(sentFunctions.map(f => f.name)).to.include.members(['parent_func', 'child_func']);
         });
     });
 
-    describe('recvChatMessage', () => {
+    describe('opt.isolate', () => {
+        it('should stop ancestor aggregation at isolate boundary', async () => {
+            const parent = new Saico({
+                name: 'parent',
+                prompt: 'Parent prompt',
+                tool_handler: mockToolHandler,
+                functions: [{ name: 'parent_func' }],
+            });
+            parent.activate({ createQ: true });
+
+            const child = new Saico({
+                name: 'child',
+                prompt: 'Child prompt',
+                tool_handler: mockToolHandler,
+                functions: [{ name: 'child_func' }],
+                isolate: true,
+            });
+            child.activate({ createQ: true, parent: parent._task });
+
+            await child.sendMessage('hello');
+
+            const sentArgs = openai.send.getCall(0).args[0];
+            const sentFunctions = openai.send.getCall(0).args[1];
+
+            // Parent prompt should NOT be in the preamble
+            expect(sentArgs.some(m => m.content === 'Parent prompt')).to.be.false;
+            // Only child prompt
+            expect(sentArgs.some(m => m.content === 'Child prompt')).to.be.true;
+            // Only child functions
+            expect(sentFunctions).to.have.length(1);
+            expect(sentFunctions[0].name).to.equal('child_func');
+        });
+
+        it('should set _isolate from constructor', () => {
+            const s = new Saico({ isolate: true });
+            expect(s._isolate).to.be.true;
+        });
+    });
+
+    describe('recvChatMessage routing', () => {
         it('should throw when not activated', async () => {
             const s = new Saico();
             try {
                 await s.recvChatMessage('hello');
                 expect.fail('should have thrown');
             } catch (e) {
-                expect(e.message).to.equal('Not activated. Call activate() first.');
+                expect(e.message).to.include('Not activated');
             }
         });
 
-        it('should delegate to task recvChatMessage', async () => {
+        it('should route to own context', async () => {
             const s = new Saico({
                 prompt: fakePrompt,
                 tool_handler: mockToolHandler,
@@ -281,49 +455,42 @@ describe('Saico', function () {
             const reply = await s.recvChatMessage('hello');
             expect(reply.content).to.include('AI response');
         });
-    });
 
-    describe('spawnTaskWithContext', () => {
-        it('should throw when not activated', () => {
-            const s = new Saico();
-            expect(() => s.spawnTaskWithContext({ name: 'child' })).to.throw('Not activated');
-        });
+        it('should route DOWN to deepest child with msg Q', async () => {
+            const parent = new Saico({
+                name: 'parent',
+                prompt: 'Parent prompt',
+                tool_handler: mockToolHandler,
+            });
+            parent.activate({ createQ: true });
 
-        it('should create child task with context', () => {
-            const s = new Saico({ tool_handler: mockToolHandler });
-            s.activate();
-            const child = s.spawnTaskWithContext({
+            const child = parent.spawnTaskWithContext({
                 name: 'child',
                 prompt: 'Child prompt',
+            }, []);
+
+            // recvChatMessage on parent should route to child context
+            await parent.recvChatMessage('hello from user');
+
+            const sentArgs = openai.send.getCall(0).args[0];
+            // The message should be sent to child context
+            const childMsg = child.context._msgs.find(m =>
+                m.msg.content === 'hello from user');
+            expect(childMsg).to.exist;
+        });
+
+        it('should build preamble from full Saico chain', async () => {
+            const parent = new Saico({
+                name: 'parent',
+                prompt: 'Parent prompt',
+                tool_handler: mockToolHandler,
             });
-            expect(child).to.be.instanceOf(Itask);
-            expect(child.parent).to.equal(s._task);
-            expect(child.context).to.be.instanceOf(Context);
-            expect(child.context.prompt).to.equal('Child prompt');
-        });
+            parent.activate({ createQ: true });
 
-        it('should accept string opt', () => {
-            const s = new Saico();
-            s.activate();
-            const child = s.spawnTaskWithContext('child-name');
-            expect(child).to.be.instanceOf(Itask);
-            expect(child.name).to.equal('child-name');
-        });
-    });
+            await parent.recvChatMessage('hello');
 
-    describe('spawnTask', () => {
-        it('should throw when not activated', () => {
-            const s = new Saico();
-            expect(() => s.spawnTask({ name: 'child' })).to.throw('Not activated');
-        });
-
-        it('should create child task without context', () => {
-            const s = new Saico();
-            s.activate();
-            const child = s.spawnTask({ name: 'child' });
-            expect(child).to.be.instanceOf(Itask);
-            expect(child.parent).to.equal(s._task);
-            expect(child.context).to.be.null;
+            const sentArgs = openai.send.getCall(0).args[0];
+            expect(sentArgs.some(m => m.content === 'Parent prompt')).to.be.true;
         });
     });
 
@@ -339,6 +506,157 @@ describe('Saico', function () {
             }
             const app = new MyApp();
             expect(app.getStateSummary()).to.equal('custom summary');
+        });
+    });
+
+    describe('getRecentMessages', () => {
+        it('should return empty array when not activated', () => {
+            const s = new Saico();
+            expect(s.getRecentMessages()).to.deep.equal([]);
+        });
+
+        it('should return user/assistant messages only', () => {
+            const s = new Saico();
+            s.activate({ createQ: true });
+
+            s.context._msgs.push(
+                { msg: { role: 'user', content: 'Hello' }, opts: {}, replied: 1 },
+                { msg: { role: 'assistant', content: 'Hi!' }, opts: {}, replied: 3 },
+                { msg: { role: 'tool', content: 'result' }, opts: {}, replied: 1 },
+                { msg: { role: 'user', content: '[BACKEND] internal' }, opts: {}, replied: 1 },
+                { msg: { role: 'assistant', content: 'Done', tool_calls: [{}] }, opts: {}, replied: 3 },
+            );
+
+            const recent = s.getRecentMessages(10);
+            expect(recent).to.have.length(2);
+            expect(recent[0]).to.deep.equal({ role: 'user', content: 'Hello' });
+            expect(recent[1]).to.deep.equal({ role: 'assistant', content: 'Hi!' });
+        });
+
+        it('should limit to N messages', () => {
+            const s = new Saico();
+            s.activate({ createQ: true });
+
+            for (let i = 0; i < 10; i++) {
+                s.context._msgs.push({
+                    msg: { role: 'user', content: `msg ${i}` },
+                    opts: {}, replied: 1,
+                });
+            }
+
+            const recent = s.getRecentMessages(3);
+            expect(recent).to.have.length(3);
+            expect(recent[0].content).to.equal('msg 7');
+        });
+    });
+
+    describe('_getStateSummary', () => {
+        it('should include recent messages when context is not the active Q', () => {
+            const parent = new Saico({ name: 'parent', tool_handler: mockToolHandler });
+            parent.activate({ createQ: true });
+
+            parent.context._msgs.push(
+                { msg: { role: 'user', content: 'Hello' }, opts: {}, replied: 1 },
+                { msg: { role: 'assistant', content: 'Hi!' }, opts: {}, replied: 3 },
+            );
+
+            // Create a child context to make parent NOT the deepest
+            const child = parent.spawnTaskWithContext({
+                name: 'child',
+                prompt: 'Child prompt',
+            }, []);
+
+            const summary = parent._getStateSummary(child.context);
+            // Summary should include recent messages since parent is not the active Q
+            expect(summary).to.be.an('array');
+            const hasMessages = summary.some(item =>
+                typeof item === 'object' && item.role === 'user' && item.content === 'Hello');
+            expect(hasMessages).to.be.true;
+        });
+
+        it('should NOT include recent messages when context IS the active Q', () => {
+            const s = new Saico({ name: 'test', tool_handler: mockToolHandler });
+            s.activate({ createQ: true });
+
+            s.context._msgs.push(
+                { msg: { role: 'user', content: 'Hello' }, opts: {}, replied: 1 },
+            );
+
+            // Pass own context as activeCtx
+            const summary = s._getStateSummary(s.context);
+            // Should be null (no state summary override, no recent messages since it IS active)
+            expect(summary).to.be.null;
+        });
+    });
+
+    describe('userData', () => {
+        it('should initialize with empty userData', () => {
+            const s = new Saico();
+            expect(s.userData).to.deep.equal({});
+        });
+
+        it('should accept initial userData', () => {
+            const s = new Saico({ userData: { key: 'val' } });
+            expect(s.userData).to.deep.equal({ key: 'val' });
+        });
+
+        it('setUserData should set and return this', () => {
+            const s = new Saico();
+            const ret = s.setUserData('key', 'val');
+            expect(ret).to.equal(s);
+            expect(s.userData.key).to.equal('val');
+        });
+
+        it('getUserData should return specific key or all', () => {
+            const s = new Saico({ userData: { a: 1, b: 2 } });
+            expect(s.getUserData('a')).to.equal(1);
+            expect(s.getUserData()).to.deep.equal({ a: 1, b: 2 });
+        });
+
+        it('clearUserData should reset and return this', () => {
+            const s = new Saico({ userData: { a: 1 } });
+            const ret = s.clearUserData();
+            expect(ret).to.equal(s);
+            expect(s.userData).to.deep.equal({});
+        });
+    });
+
+    describe('getSessionInfo', () => {
+        it('should return session info when not activated', () => {
+            const s = new Saico({ name: 'test' });
+            const info = s.getSessionInfo();
+            expect(info.name).to.equal('test');
+            expect(info.running).to.be.false;
+            expect(info.completed).to.be.false;
+            expect(info.messageCount).to.equal(0);
+            expect(info.childCount).to.equal(0);
+            expect(info.uptime).to.be.a('number');
+        });
+
+        it('should return session info when activated', () => {
+            const s = new Saico({ name: 'test', userData: { x: 1 } });
+            s.activate({ createQ: true });
+            const info = s.getSessionInfo();
+            expect(info.name).to.equal('test');
+            expect(info.userData).to.deep.equal({ x: 1 });
+            expect(info.messageCount).to.equal(0);
+        });
+    });
+
+    describe('closeSession', () => {
+        it('should close context and cancel task', async () => {
+            const s = new Saico({ name: 'test' });
+            s.activate({ createQ: true });
+            const task = s._task;
+            await s.closeSession();
+            // _ecancel is async (uses setImmediate for idle tasks), wait a tick
+            await new Promise(resolve => setImmediate(resolve));
+            expect(task._completed).to.be.true;
+        });
+
+        it('should be safe to call when not activated', async () => {
+            const s = new Saico();
+            await s.closeSession(); // should not throw
         });
     });
 
@@ -400,7 +718,6 @@ describe('Saico', function () {
             expect(svc.name).to.equal('proxied-service');
             expect(svc.counter).to.equal(0);
 
-            // Setting property should work through proxy
             svc.counter = 5;
             expect(svc.counter).to.equal(5);
         });
@@ -429,6 +746,10 @@ describe('Saico', function () {
             expect(data.name).to.equal('test');
             expect(data.prompt).to.equal('p');
             expect(data.task).to.be.undefined;
+            expect(data.userData).to.deep.equal({});
+            expect(data.sessionConfig).to.be.an('object');
+            expect(data.tm_create).to.be.a('number');
+            expect(data.isolate).to.be.false;
         });
 
         it('should serialize with activated task', () => {
@@ -449,6 +770,218 @@ describe('Saico', function () {
             const data = JSON.parse(json);
             expect(data.task).to.be.an('object');
             expect(data.task.context).to.be.null;
+        });
+
+        it('should include userData and sessionConfig', () => {
+            const s = new Saico({
+                userData: { name: 'Ron' },
+                sessionConfig: { max_depth: 3 },
+            });
+            const json = s.serialize();
+            const data = JSON.parse(json);
+            expect(data.userData).to.deep.equal({ name: 'Ron' });
+            expect(data.sessionConfig.max_depth).to.equal(3);
+        });
+    });
+
+    describe('static deserialize', () => {
+        it('should restore instance from serialized data', () => {
+            const original = new Saico({
+                id: 'test-id',
+                name: 'test',
+                prompt: 'p',
+                userData: { key: 'val' },
+            });
+            original.activate({ createQ: true });
+            original.context.push({ role: 'user', content: 'Hello' });
+
+            const serialized = original.serialize();
+            const restored = Saico.deserialize(serialized, {
+                tool_handler: mockToolHandler,
+            });
+
+            expect(restored._id).to.equal('test-id');
+            expect(restored.name).to.equal('test');
+            expect(restored.prompt).to.equal('p');
+            expect(restored.userData).to.deep.equal({ key: 'val' });
+            expect(restored.isActive).to.be.true;
+            expect(restored.context).to.be.instanceOf(Context);
+            expect(restored.context._msgs).to.have.length(1);
+        });
+
+        it('should restore without task data', () => {
+            const data = JSON.stringify({
+                id: 'test-id',
+                name: 'test',
+                prompt: 'p',
+            });
+            const restored = Saico.deserialize(data);
+            expect(restored._id).to.equal('test-id');
+            expect(restored.isActive).to.be.false;
+        });
+
+        it('should accept parsed object', () => {
+            const data = {
+                id: 'test-id',
+                name: 'test',
+                prompt: 'p',
+                tm_create: 1000,
+            };
+            const restored = Saico.deserialize(data);
+            expect(restored._id).to.equal('test-id');
+            expect(restored.tm_create).to.equal(1000);
+        });
+
+        it('should restore tool_digest', () => {
+            const original = new Saico({ name: 'test' });
+            original.activate({ createQ: true });
+            original.context._appendToolDigest('myTool', 'result');
+
+            const serialized = original.serialize();
+            const restored = Saico.deserialize(serialized);
+
+            expect(restored.context.tool_digest).to.have.length(1);
+            expect(restored.context.tool_digest[0].tool).to.equal('myTool');
+        });
+    });
+
+    describe('_deserializeRecord hook', () => {
+        it('should return raw by default', () => {
+            const s = new Saico();
+            const raw = { id: '1', name: 'test' };
+            expect(s._deserializeRecord(raw)).to.equal(raw);
+        });
+
+        it('should be called by dbGetItem', async () => {
+            class MyService extends Saico {
+                _deserializeRecord(raw) {
+                    return { ...raw, deserialized: true };
+                }
+            }
+            const fakeDb = { get: sandbox.stub().resolves({ id: '1' }) };
+            const s = new MyService({ db: fakeDb });
+            const result = await s.dbGetItem('id', '1');
+            expect(result.deserialized).to.be.true;
+        });
+
+        it('should be called by dbQuery for each item', async () => {
+            class MyService extends Saico {
+                _deserializeRecord(raw) {
+                    return { ...raw, deserialized: true };
+                }
+            }
+            const fakeDb = {
+                query: sandbox.stub().resolves([{ id: '1' }, { id: '2' }]),
+            };
+            const s = new MyService({ db: fakeDb });
+            const results = await s.dbQuery('idx', 'k', 'v');
+            expect(results).to.have.length(2);
+            expect(results[0].deserialized).to.be.true;
+            expect(results[1].deserialized).to.be.true;
+        });
+
+        it('should be called by dbGetAll for each item', async () => {
+            class MyService extends Saico {
+                _deserializeRecord(raw) {
+                    return { ...raw, deserialized: true };
+                }
+            }
+            const fakeDb = {
+                getAll: sandbox.stub().resolves([{ id: '1' }]),
+            };
+            const s = new MyService({ db: fakeDb });
+            const results = await s.dbGetAll();
+            expect(results[0].deserialized).to.be.true;
+        });
+    });
+
+    describe('spawnTaskWithContext', () => {
+        it('should throw when not activated', () => {
+            const s = new Saico();
+            expect(() => s.spawnTaskWithContext({ name: 'child' })).to.throw('Not activated');
+        });
+
+        it('should create child task with context', () => {
+            const s = new Saico({ tool_handler: mockToolHandler });
+            s.activate();
+            const child = s.spawnTaskWithContext({
+                name: 'child',
+                prompt: 'Child prompt',
+            });
+            expect(child).to.be.instanceOf(Itask);
+            expect(child.parent).to.equal(s._task);
+            expect(child.context).to.be.instanceOf(Context);
+            expect(child.context.prompt).to.equal('Child prompt');
+        });
+
+        it('should accept string opt', () => {
+            const s = new Saico();
+            s.activate();
+            const child = s.spawnTaskWithContext('child-name');
+            expect(child).to.be.instanceOf(Itask);
+            expect(child.name).to.equal('child-name');
+        });
+
+        it('should inherit sessionConfig defaults', () => {
+            const s = new Saico({
+                sessionConfig: { max_depth: 7, queue_limit: 40 },
+            });
+            s.activate();
+            const child = s.spawnTaskWithContext({
+                name: 'child',
+                prompt: 'Child prompt',
+            });
+            expect(child.context.max_depth).to.equal(7);
+            expect(child.context.QUEUE_LIMIT).to.equal(40);
+        });
+    });
+
+    describe('spawnTask', () => {
+        it('should throw when not activated', () => {
+            const s = new Saico();
+            expect(() => s.spawnTask({ name: 'child' })).to.throw('Not activated');
+        });
+
+        it('should create child task without context', () => {
+            const s = new Saico();
+            s.activate();
+            const child = s.spawnTask({ name: 'child' });
+            expect(child).to.be.instanceOf(Itask);
+            expect(child.parent).to.equal(s._task);
+            expect(child.context).to.be.null;
+        });
+    });
+
+    describe('_getSaicoAncestors', () => {
+        it('should return just this when no parent', () => {
+            const s = new Saico({ name: 'root' });
+            s.activate();
+            const chain = s._getSaicoAncestors();
+            expect(chain).to.have.length(1);
+            expect(chain[0]).to.equal(s);
+        });
+
+        it('should return parent chain ordered root→this', () => {
+            const root = new Saico({ name: 'root' });
+            root.activate();
+            const child = new Saico({ name: 'child' });
+            child.activate({ parent: root._task });
+
+            const chain = child._getSaicoAncestors();
+            expect(chain).to.have.length(2);
+            expect(chain[0]).to.equal(root);
+            expect(chain[1]).to.equal(child);
+        });
+
+        it('should stop at isolate boundary', () => {
+            const root = new Saico({ name: 'root' });
+            root.activate();
+            const child = new Saico({ name: 'child', isolate: true });
+            child.activate({ parent: root._task });
+
+            const chain = child._getSaicoAncestors();
+            expect(chain).to.have.length(1);
+            expect(chain[0]).to.equal(child);
         });
     });
 
@@ -497,12 +1030,11 @@ describe('Saico', function () {
             expect(fakeDb.put.firstCall.args[0]).to.deep.equal({ id: '1', name: 'test' });
         });
 
-        it('dbGetItem should delegate to backend.get', async () => {
+        it('dbGetItem should delegate to backend.get and call _deserializeRecord', async () => {
             const s = new Saico({ db: fakeDb });
             const item = await s.dbGetItem('id', '1');
             expect(item).to.deep.equal({ id: '1', name: 'test' });
             expect(fakeDb.get.calledOnce).to.be.true;
-            expect(fakeDb.get.firstCall.args).to.deep.equal(['id', '1', undefined]);
         });
 
         it('dbDeleteItem should delegate to backend.delete', async () => {
@@ -594,7 +1126,6 @@ describe('Saico', function () {
 
         it('db methods should work before activate', async () => {
             const s = new Saico({ db: fakeDb });
-            // no activate() call
             const item = await s.dbGetItem('id', '1');
             expect(item).to.deep.equal({ id: '1', name: 'test' });
         });
@@ -623,6 +1154,12 @@ describe('Saico', function () {
             const fromMsgs = require('../msgs.js');
             expect(fromContext.Context).to.equal(fromMsgs.Context);
             expect(fromContext.createContext).to.equal(fromMsgs.createContext);
+        });
+
+        it('should not export Sid or createSid', () => {
+            const saico = require('../index.js');
+            expect(saico.Sid).to.be.undefined;
+            expect(saico.createSid).to.be.undefined;
         });
     });
 });

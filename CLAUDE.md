@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture Overview
 
-Saico is a hierarchical AI conversation orchestrator library. The **Saico** master class is the primary abstraction external users extend. It separates object lifecycle from task activation — instances can be created with DB access and Redis persistence, extended with custom methods, and activated into running Itask instances when ready.
+Saico is a hierarchical AI conversation orchestrator library. The **Saico** master class is the single primary abstraction external users extend. It separates object lifecycle from task activation — instances can be created with DB access and Redis persistence, extended with custom methods, and activated into running Itask instances when ready. Saico orchestrates the full message payload sent to the LLM by walking its parent chain to aggregate prompts, tools, digests, and state summaries.
 
 ### Core Components
 
@@ -29,16 +29,17 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
 |  | - Redis Proxy     |                                              |
 |  | - DB methods      |                                              |
 |  | - activate()      |                                              |
+|  | - sendMessage()   |  <-- Orchestrates preamble from chain        |
+|  | - recvChatMessage |  <-- Routes to deepest child Q               |
+|  | - userData        |                                              |
+|  | - serialize()     |                                              |
 |  +--------+----------+                                              |
 |           | creates via activate()                                  |
 |           v                                                         |
-|  +--------------+    +--------------+    +--------------+          |
-|  |    Itask     |    |   Context    |    |     Sid      |          |
-|  |  (Base Task) |<---|  (msgs.js)   |    | (Root Task)  |          |
-|  +--------------+    +--------------+    +--------------+          |
-|         ^                                       |                   |
-|         +---------------------------------------+                   |
-|                    extends                                          |
+|  +--------------+    +--------------+                               |
+|  |    Itask     |    |   Context    |                               |
+|  |  (Base Task) |<---|  (msgs.js)   |                               |
+|  +--------------+    +--------------+                               |
 |                                                                     |
 |  +-------------------+    +-------------------+                     |
 |  |      Store        |    | DynamoDBAdapter   |                     |
@@ -53,9 +54,7 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - `DynamoDBAdapter` - DynamoDB storage adapter
    - `Itask` - Base task class
    - `Context` - Conversation context class
-   - `Sid` - Session root task class
    - `createTask()` - Factory for tasks with optional context
-   - `createSid()` - Factory for session root tasks
    - `createContext()` - Factory for standalone contexts
    - `createQ()` - Legacy compatibility factory
 
@@ -64,12 +63,20 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - Constructor returns Redis observable proxy when Redis is available
    - `activate(opts)` creates internal Itask; `opts.createQ` flag attaches message Q context
    - `opts.prompt` appends to class-level prompt (NOT a trigger for context creation)
+   - **sendMessage orchestration**: walks Saico parent chain to build preamble (prompts, state summaries, tool digests) and aggregated functions, passes to Context via `_preamble` and `_aggregatedFunctions` opts
+   - **recvChatMessage routing**: routes DOWN to deepest descendant with a msg Q
+   - `opt.isolate` stops ancestor aggregation at this Saico boundary
    - Generic DB methods (`dbPutItem`, `dbGetItem`, `dbQuery`, etc.) delegate to pluggable backend
+   - DB retrieval methods (`dbGetItem`, `dbQuery`, `dbGetAll`) call `_deserializeRecord()` hook
    - `opt.dynamodb_table` auto-creates DynamoDBAdapter; `opt.db` accepts any adapter
-   - Message relay: `sendMessage()`, `recvChatMessage()` delegate to internal task
-   - Child spawning: `spawnTaskWithContext()`, `spawnTask()`
+   - Child spawning: `spawnTaskWithContext()`, `spawnTask()` — inherit `sessionConfig` defaults
    - Overridable `getStateSummary()` hook
-   - Serialization support
+   - `getRecentMessages(n)` — user/assistant messages (no tool calls, no BACKEND)
+   - `_getStateSummary(activeCtx)` — includes recent messages when context is not the active Q
+   - **deactivate**: bubbles cleaned messages to parent Q, then closes context
+   - User data: `userData`, `setUserData()`, `getUserData()`, `clearUserData()`
+   - Session info: `getSessionInfo()`, `closeSession()`, `sessionConfig`
+   - Serialization: `serialize()`, `static Saico.deserialize()`
 
 3. **itask.js** - Base task class for hierarchical task management
    - Named state parsing (try, catch, finally, cancel)
@@ -78,14 +85,16 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - Promise/thenable interface
    - Context support for AI conversations
    - `sendMessage()` delegates to context hierarchy
+   - `findDeepestContext()` walks DOWN to find deepest active descendant with a context
 
 4. **msgs.js** - Conversation context with message handling (renamed from context.js)
    - Message queue management with Proxy wrapper
    - Tool call handling (depth control, deferred execution, duplicate detection)
    - Message queueing for pending tool calls
    - Summarization support
-   - Hierarchical context gathering via task hierarchy
-   - `getFunctions()` aggregates from ancestor contexts
+   - `_createMsgQ(preamble, add_tag, tag_filter)` — when preamble is provided (by Saico), it is prepended as-is and does NOT count against QUEUE_LIMIT. Otherwise falls back to standalone behavior (own prompt + tool digest)
+   - `_processSendMessage` uses `_preamble` and `_aggregatedFunctions` from opts when available
+   - `getFunctions()` aggregates from ancestor contexts (standalone fallback)
    - `context.js` still exists as a backward-compatibility shim re-exporting from `msgs.js`
 
 5. **dynamo.js** - DynamoDB storage adapter (generalized from backend/aws.js)
@@ -97,69 +106,76 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - AWS SDK v3 packages are optional peer dependencies (loaded only when needed)
    - Injectable client for testing
 
-6. **sid.js** - Session/User root task (extends Itask)
-   - Always has a conversation context
-   - JSON serialization for persistence
-   - User data storage
-   - Helper methods for spawning child tasks
-
-7. **openai.js** - OpenAI API wrapper with retry logic
+6. **openai.js** - OpenAI API wrapper with retry logic
    - Handles rate limiting (429 errors) with automatic retry
    - Supports modern tools API
    - Requires OPENAI_API_KEY environment variable
 
-8. **store.js** - Storage abstraction layer
+7. **store.js** - Storage abstraction layer
    - `Store` singleton with Redis cache + pluggable backends
    - `DynamoBackend` for Store's internal persistence (save/load/delete by ID)
 
-9. **redis.js** - Optional Redis persistence layer
+8. **redis.js** - Optional Redis persistence layer
    - Creates observable proxies for automatic state persistence
    - Debounced saves with change detection
    - Properties prefixed with `_` are internal and not persisted
 
-10. **util.js** - Utilities including token counting and logging
+9. **util.js** - Utilities including token counting and logging
 
 ### Key Patterns
 
 **Saico Lifecycle**: Separate construction from activation:
 - `new Saico(opt)` — creates instance with Redis proxy + DB access. No Itask yet.
 - `instance.activate({ createQ: true })` — creates internal Itask + optional message Q context
-- `instance.deactivate()` — closes context, cancels task
+- `instance.deactivate()` — bubbles cleaned messages to parent, closes context, cancels task
+- `instance.closeSession()` — closes context and cancels task
 - DB methods (`dbGetItem`, etc.) work before and after activation
 
 **Pluggable DB Backend**: The Saico class has generic DB methods that delegate to `this._db`:
 - Configure via `opt.dynamodb_table` (auto-creates DynamoDBAdapter) or `opt.db` (any adapter)
 - All `db*` methods are no-ops when no backend is configured
+- DB retrieval methods call `_deserializeRecord()` hook — override to restore class instances
 - Any adapter implementing the same interface (put/get/delete/query/getAll/update/updatePath/listAppend/listAppendPath/nextCounterId/getCounterValue/setCounterValue/countItems) can be used
 
 **Task Hierarchy**: Parent-child relationship where:
 - Tasks can have contexts attached (optional)
 - Child tasks inherit tool_handler and functions from parents
-- Context gathering walks up the task hierarchy
-- Summaries bubble up to parent contexts when tasks close
+- `findDeepestContext()` walks down to find the deepest active descendant with a context
 
-**Message Flow**:
+**Message Flow (Saico orchestration)**:
 ```
-sendMessage() call on any task:
+sendMessage() on Saico instance:
 
-Task A (root/Sid with Context)
-  +- Task B (with Context)
-       +- Task C (current task with Context)
-            sendMessage()
+Saico A (root, with Context)
+  +- Saico B (with Context)
+       +- Saico C (current, with Context)
+            sendMessage('hello')
                  |
                  v
-    1. Gather context from hierarchy:
-       - Walk up: C -> B -> A
-       - Collect prompts, summaries, messages from each context
-       - Aggregate functions from each level
+    1. Walk Saico parent chain (_getSaicoAncestors):
+       A -> B -> C  (stop at isolate boundary)
 
-    2. Build message queue:
-       [A.prompt, A.summaries, B.prompt, B.summaries, C.prompt, C.messages]
+    2. For each Saico in chain, collect:
+       - prompt (system message)
+       - _getStateSummary(activeCtx) — own summary + recent msgs if not active Q
+       - tool_digest (if context has entries)
+       - functions
 
-    3. Send to model with aggregated functions
+    3. Build preamble array: [A.prompt, A.summary, A.digest, B.prompt, ...]
 
-    4. Handle tool calls with depth control
+    4. Pass preamble + aggregated functions to Context via opts:
+       ctx.sendMessage('user', content, null, { _preamble, _aggregatedFunctions })
+
+    5. Context._createMsgQ prepends preamble, appends own Q messages (QUEUE_LIMIT applies only to Q)
+
+    6. Send to LLM with aggregated functions
+
+    7. Handle tool calls with depth control
 ```
+
+**recvChatMessage routing**: routes DOWN to `findDeepestContext()` — the deepest active descendant with a message Q receives the user message.
+
+**opt.isolate**: When a Saico is created with `isolate: true`, its `_getSaicoAncestors()` returns only itself — parent prompts, tools, digests, and summaries are NOT aggregated above this point.
 
 **Tool Calls Management**:
 - **Depth Control**: `max_depth` (default: 5) prevents infinite recursion
@@ -173,7 +189,7 @@ Task A (root/Sid with Context)
 ```js
 {
   msg: { role, content, name?, tool_call_id?, tool_calls? },
-  opts: { summary?, noreply?, nofunc?, handler?, timeout? },
+  opts: { summary?, noreply?, nofunc?, handler?, timeout?, _preamble?, _aggregatedFunctions? },
   msgid: String,
   replied: 0 | 1 | 3  // 0=pending, 1=user sent, 3=AI replied
 }
@@ -192,22 +208,22 @@ class MyAgent extends Saico {
             prompt: 'You are a helpful assistant.',
             dynamodb_table: 'my_data',
             tool_handler: (name, args) => this.handleTool(name, args),
-            functions: [{ name: 'lookup', ... }]
+            functions: [{ name: 'lookup', ... }],
+            userData: { userId },
         });
-        this.userId = userId;  // triggers Redis save via proxy
     }
 
     async start() {
         // DB works BEFORE activate
-        const user = await this.dbGetItem('id', this.userId);
+        const user = await this.dbGetItem('id', this.getUserData('userId'));
 
         // activate creates Itask + message Q
-        this.activate({ createQ: true, prompt: `User: ${this.userId}` });
+        this.activate({ createQ: true, prompt: `User: ${this.getUserData('userId')}` });
         return this;
     }
 
     getStateSummary() {
-        return `Active user: ${this.userId}`;
+        return `Active user: ${this.getUserData('userId')}`;
     }
 
     async handleTool(name, args) { /* ... */ }
@@ -222,10 +238,10 @@ const reply = await agent.recvChatMessage('Hello!');
 ```javascript
 // CRUD
 await this.dbPutItem({ id: '123', name: 'test' });
-const item = await this.dbGetItem('id', '123');
+const item = await this.dbGetItem('id', '123');  // calls _deserializeRecord()
 await this.dbDeleteItem('id', '123');
-const items = await this.dbQuery('email-index', 'email', 'user@test.com');
-const all = await this.dbGetAll();
+const items = await this.dbQuery('email-index', 'email', 'user@test.com');  // calls _deserializeRecord()
+const all = await this.dbGetAll();  // calls _deserializeRecord()
 
 // Updates
 await this.dbUpdate('id', '123', 'status', 'active');
@@ -241,23 +257,36 @@ await this.dbSetCounterValue('OrderId', 100);
 const total = await this.dbCountItems();
 ```
 
-**Creating a Session (Sid)**:
+**Session management**:
 ```javascript
-const { createSid } = require('saico');
-
-const session = createSid({
+const session = new Saico({
     name: 'my-session',
     prompt: 'You are a helpful assistant',
     tool_handler: async (name, args) => { /* ... */ },
-    functions: [{ name: 'myFunc', ... }]
+    functions: [{ name: 'myFunc', ... }],
+    userData: { userId: '123' },
+    sessionConfig: { max_depth: 3, queue_limit: 50 },
 });
+session.activate({ createQ: true });
 
-const reply = await session.sendMessage('Hello!');
+// Send messages
+const reply = await session.sendMessage('Backend instruction');  // [BACKEND] prefixed
+const chatReply = await session.recvChatMessage('Hello!');       // user message, routes to deepest Q
+
+// User data
+session.setUserData('role', 'admin');
+session.getUserData('role');  // 'admin'
+
+// Session info
+session.getSessionInfo();  // { id, name, running, completed, messageCount, ... }
+
+// Close
+await session.closeSession();
 ```
 
 **Spawning Child Tasks**:
 ```javascript
-// Task with its own context
+// Task with its own context (inherits sessionConfig defaults)
 const childTask = session.spawnTaskWithContext({
     name: 'subtask',
     prompt: 'Handling a specific sub-task'
@@ -277,6 +306,16 @@ const simpleTask = session.spawnTask({
 ]);
 ```
 
+**Isolate (stop ancestor aggregation)**:
+```javascript
+const isolated = new Saico({
+    name: 'isolated-agent',
+    prompt: 'Independent agent prompt',
+    isolate: true,  // parent prompts/tools/digests not included
+});
+isolated.activate({ createQ: true, parent: parentSaico._task });
+```
+
 **Legacy createQ (backward compatibility)**:
 ```javascript
 const { createQ } = require('saico');
@@ -291,9 +330,20 @@ const reply = await ctx.sendMessage('user', 'Hello', functions);
 const serialized = session.serialize();
 
 // Restore session
-const restored = Sid.deserialize(serialized, {
+const restored = Saico.deserialize(serialized, {
     tool_handler: myHandler
 });
+```
+
+**DB deserialization hook**:
+```javascript
+class MyService extends Saico {
+    _deserializeRecord(raw) {
+        // Transform raw DB records, e.g. restore class instances
+        if (raw.type === 'order') return new Order(raw);
+        return raw;
+    }
+}
 ```
 
 ### Tool Handler Interface
@@ -311,13 +361,12 @@ async function toolHandler(toolName, argumentsString) {
 
 ```
 /saico
-+-- index.js          # Main entry point (exports Saico, DynamoDBAdapter, Itask, Context, Sid, etc.)
++-- index.js          # Main entry point (exports Saico, DynamoDBAdapter, Itask, Context, etc.)
 +-- saico.js          # Master class (extend this)
 +-- itask.js          # Base task class
 +-- msgs.js           # Message/conversation context (renamed from context.js)
 +-- context.js        # Backward-compat shim re-exporting from msgs.js
 +-- dynamo.js         # DynamoDB storage adapter
-+-- sid.js            # Session root task
 +-- store.js          # Store abstraction (Redis + backends)
 +-- openai.js         # OpenAI wrapper
 +-- util.js           # Utilities
@@ -327,18 +376,16 @@ async function toolHandler(toolName, argumentsString) {
     +-- dynamo.test.js      # DynamoDB adapter tests
     +-- itask.test.js       # Task hierarchy tests
     +-- context.test.js     # Message handling tests
-    +-- sid.test.js         # Session management tests
     +-- integration.test.js # Full hierarchy flow tests
 ```
 
 ### Testing Framework
 
 Uses Mocha with Chai and Sinon for:
-- Saico class lifecycle, DB delegation, subclass extension, Redis proxy (saico.test.js)
+- Saico class lifecycle, DB delegation, subclass extension, Redis proxy, sendMessage orchestration, recvChatMessage routing, preamble building, opt.isolate, deactivate bubbling, userData, sessionConfig, serialize/deserialize, DB deserialize hook, closeSession, getSessionInfo (saico.test.js)
 - DynamoDB adapter with mocked client (dynamo.test.js)
-- Task hierarchy, states, cancellation (itask.test.js)
-- Message handling, tool calls, context aggregation (context.test.js)
-- Session management, serialization, user data (sid.test.js)
+- Task hierarchy, states, cancellation, findDeepestContext (itask.test.js)
+- Message handling, tool calls, _createMsgQ with preamble support (context.test.js)
 - Full hierarchy message flow, legacy compatibility (integration.test.js)
 
 Test files mock external dependencies (OpenAI API, token counting, DynamoDB client) for isolated unit testing. DB adapter tests inject a mock client via `opt.client`.
