@@ -66,9 +66,10 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - **sendMessage orchestration**: walks Saico parent chain to build preamble (prompts, state summaries, tool digests) and aggregated functions, passes to Context via `_preamble` and `_aggregatedFunctions` opts
    - **recvChatMessage routing**: routes DOWN to deepest descendant with a msg Q
    - `opt.isolate` stops ancestor aggregation at this Saico boundary
-   - Generic DB methods (`dbPutItem`, `dbGetItem`, `dbQuery`, etc.) delegate to pluggable backend
+   - Generic DB methods (`dbPutItem`, `dbGetItem`, `dbQuery`, etc.) delegate to pluggable backend; table name required on every call
+   - `_getDb()` searches up parent Saico chain when no local `_db`; throws if none found
    - DB retrieval methods (`dbGetItem`, `dbQuery`, `dbGetAll`) call `_deserializeRecord()` hook
-   - `opt.dynamodb_table` auto-creates DynamoDBAdapter; `opt.db` accepts any adapter
+   - `opt.dynamodb = { region, credentials }` auto-creates DynamoDBAdapter; `opt.db` accepts any adapter
    - Child spawning: `spawnTaskWithContext()`, `spawnTask()` — inherit `sessionConfig` defaults
    - Overridable `getStateSummary()` hook
    - `getRecentMessages(n)` — user/assistant messages (no tool calls, no BACKEND)
@@ -104,7 +105,8 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - Update operations: `update`, `updatePath`, `listAppend`, `listAppendPath`
    - Counter operations: `nextCounterId`, `getCounterValue`, `setCounterValue`
    - Utility: `countItems`
-   - All methods accept optional `table` override (defaults to constructor table)
+   - Table name required on every method call (no default table)
+   - Constructor: `{ region, credentials: { accessKeyId, secretAccessKey }, client }`
    - AWS SDK v3 packages are optional peer dependencies (loaded only when needed)
    - Injectable client for testing
 
@@ -133,15 +135,17 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
 - `instance.closeSession()` — closes context and cancels task
 - DB methods (`dbGetItem`, etc.) work before and after activation
 
-**Pluggable DB Backend**: The Saico class has generic DB methods that delegate to `this._db`:
-- Configure via `opt.dynamodb_table` (auto-creates DynamoDBAdapter) or `opt.db` (any adapter)
-- All `db*` methods are no-ops when no backend is configured
+**Pluggable DB Backend**: The Saico class has generic DB methods that delegate to `_getDb()`:
+- Configure via `opt.dynamodb = { region, credentials }` (auto-creates DynamoDBAdapter) or `opt.db` (any adapter)
+- `_getDb()` searches own `_db` first, then walks UP the parent Saico chain; throws if none found
+- Table name is required on every `db*` call (no default table)
 - DB retrieval methods call `_deserializeRecord()` hook — override to restore class instances
 - Any adapter implementing the same interface (put/get/delete/query/getAll/update/updatePath/listAppend/listAppendPath/nextCounterId/getCounterValue/setCounterValue/countItems) can be used
 
 **Task Hierarchy**: Parent-child relationship where:
 - Tasks can have contexts attached (optional)
 - Child tasks inherit functions from parents; `TOOL_` methods are discovered by searching the Saico hierarchy
+- Child Saico instances inherit DB access from parents via `_getDb()` parent chain search
 - `findDeepestContext()` walks down to find the deepest active descendant with a context
 
 **Message Flow (Saico orchestration)**:
@@ -208,7 +212,7 @@ class MyAgent extends Saico {
         super({
             name: 'my-agent',
             prompt: 'You are a helpful assistant.',
-            dynamodb_table: 'my_data',
+            dynamodb: { region: 'us-east-1', credentials: { accessKeyId: 'AK', secretAccessKey: 'SK' } },
             functions: [{ name: 'lookup', ... }],
             userData: { userId },
         });
@@ -239,27 +243,27 @@ await agent.start();
 const reply = await agent.recvChatMessage('Hello!');
 ```
 
-**Saico DB methods** (backend-agnostic):
+**Saico DB methods** (backend-agnostic, table required on every call):
 ```javascript
 // CRUD
-await this.dbPutItem({ id: '123', name: 'test' });
-const item = await this.dbGetItem('id', '123');  // calls _deserializeRecord()
-await this.dbDeleteItem('id', '123');
-const items = await this.dbQuery('email-index', 'email', 'user@test.com');  // calls _deserializeRecord()
-const all = await this.dbGetAll();  // calls _deserializeRecord()
+await this.dbPutItem({ id: '123', name: 'test' }, 'my-table');
+const item = await this.dbGetItem('id', '123', 'my-table');  // calls _deserializeRecord()
+await this.dbDeleteItem('id', '123', 'my-table');
+const items = await this.dbQuery('email-index', 'email', 'user@test.com', 'my-table');  // calls _deserializeRecord()
+const all = await this.dbGetAll('my-table');  // calls _deserializeRecord()
 
 // Updates
-await this.dbUpdate('id', '123', 'status', 'active');
-await this.dbUpdatePath('id', '123', [{key: 'nested'}], 'field', 'value');
-await this.dbListAppend('id', '123', 'tags', 'new-tag');
+await this.dbUpdate('id', '123', 'status', 'active', 'my-table');
+await this.dbUpdatePath('id', '123', [{key: 'nested'}], 'field', 'value', 'my-table');
+await this.dbListAppend('id', '123', 'tags', 'new-tag', 'my-table');
 
 // Counters
-const nextId = await this.dbNextCounterId('OrderId');
-const count = await this.dbGetCounterValue('OrderId');
-await this.dbSetCounterValue('OrderId', 100);
+const nextId = await this.dbNextCounterId('OrderId', 'counters');
+const count = await this.dbGetCounterValue('OrderId', 'counters');
+await this.dbSetCounterValue('OrderId', 100, 'counters');
 
 // Utility
-const total = await this.dbCountItems();
+const total = await this.dbCountItems('my-table');
 ```
 
 **Session management**:

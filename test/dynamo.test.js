@@ -20,7 +20,6 @@ describe('DynamoDBAdapter', function () {
         };
 
         adapter = new DynamoDBAdapter({
-            table: 'test-table',
             client: mockClient,
         });
         // Mock the doc client separately (lazy getter won't work with mock client)
@@ -32,10 +31,6 @@ describe('DynamoDBAdapter', function () {
     });
 
     describe('constructor', () => {
-        it('should set default table', () => {
-            expect(adapter.defaultTable).to.equal('test-table');
-        });
-
         it('should default region to us-east-1', () => {
             expect(adapter._region).to.equal('us-east-1');
         });
@@ -48,38 +43,41 @@ describe('DynamoDBAdapter', function () {
         it('should use injected client', () => {
             expect(adapter._client).to.equal(mockClient);
         });
+
+        it('should accept credentials', () => {
+            const creds = { accessKeyId: 'AK', secretAccessKey: 'SK' };
+            const a = new DynamoDBAdapter({ credentials: creds, client: mockClient });
+            expect(a._client).to.equal(mockClient);
+        });
     });
 
     describe('_table', () => {
-        it('should return default table when no override', () => {
-            expect(adapter._table()).to.equal('test-table');
+        it('should return table when provided', () => {
+            expect(adapter._table('my-table')).to.equal('my-table');
         });
 
-        it('should return override table', () => {
-            expect(adapter._table('other-table')).to.equal('other-table');
-        });
-
-        it('should throw when no table configured and none provided', () => {
-            const a = new DynamoDBAdapter({ client: mockClient });
-            expect(() => a._table()).to.throw('no table specified');
+        it('should throw when no table provided', () => {
+            expect(() => adapter._table()).to.throw('table name required');
         });
     });
 
     describe('put', () => {
         it('should send PutItemCommand with marshalled item', async () => {
             mockClient.send.resolves({});
-            await adapter.put({ id: '123', name: 'test' });
+            await adapter.put({ id: '123', name: 'test' }, 'test-table');
             expect(mockClient.send.calledOnce).to.be.true;
             const cmd = mockClient.send.firstCall.args[0];
             expect(cmd.input.TableName).to.equal('test-table');
             expect(cmd.input.Item).to.be.an('object');
         });
 
-        it('should use override table', async () => {
-            mockClient.send.resolves({});
-            await adapter.put({ id: '1' }, 'other-table');
-            const cmd = mockClient.send.firstCall.args[0];
-            expect(cmd.input.TableName).to.equal('other-table');
+        it('should throw when no table provided', async () => {
+            try {
+                await adapter.put({ id: '1' });
+                expect.fail('should have thrown');
+            } catch (e) {
+                expect(e.message).to.include('table name required');
+            }
         });
     });
 
@@ -88,28 +86,21 @@ describe('DynamoDBAdapter', function () {
             mockClient.send.resolves({
                 Item: { id: { S: '123' }, name: { S: 'test' } },
             });
-            const item = await adapter.get('id', '123');
+            const item = await adapter.get('id', '123', 'test-table');
             expect(item).to.deep.equal({ id: '123', name: 'test' });
         });
 
         it('should return undefined when item not found', async () => {
             mockClient.send.resolves({ Item: undefined });
-            const item = await adapter.get('id', '999');
+            const item = await adapter.get('id', '999', 'test-table');
             expect(item).to.be.undefined;
-        });
-
-        it('should use override table', async () => {
-            mockClient.send.resolves({ Item: { id: { S: '1' } } });
-            await adapter.get('id', '1', 'other-table');
-            const cmd = mockClient.send.firstCall.args[0];
-            expect(cmd.input.TableName).to.equal('other-table');
         });
     });
 
     describe('delete', () => {
         it('should send DeleteItemCommand', async () => {
             mockClient.send.resolves({});
-            await adapter.delete('id', '123');
+            await adapter.delete('id', '123', 'test-table');
             expect(mockClient.send.calledOnce).to.be.true;
             const cmd = mockClient.send.firstCall.args[0];
             expect(cmd.input.TableName).to.equal('test-table');
@@ -124,14 +115,14 @@ describe('DynamoDBAdapter', function () {
                     { id: { S: '2' }, email: { S: 'a@b.com' } },
                 ],
             });
-            const items = await adapter.query('email-index', 'email', 'a@b.com');
+            const items = await adapter.query('email-index', 'email', 'a@b.com', 'test-table');
             expect(items).to.have.lengthOf(2);
             expect(items[0].email).to.equal('a@b.com');
         });
 
         it('should return undefined when no items', async () => {
             mockClient.send.resolves({ Items: undefined });
-            const items = await adapter.query('idx', 'k', 'v');
+            const items = await adapter.query('idx', 'k', 'v', 'test-table');
             expect(items).to.be.undefined;
         });
     });
@@ -144,13 +135,13 @@ describe('DynamoDBAdapter', function () {
                     { id: { S: '2' } },
                 ],
             });
-            const items = await adapter.getAll();
+            const items = await adapter.getAll('test-table');
             expect(items).to.have.lengthOf(2);
         });
 
         it('should return empty array when no items', async () => {
             mockClient.send.resolves({ Items: [] });
-            const items = await adapter.getAll();
+            const items = await adapter.getAll('test-table');
             expect(items).to.deep.equal([]);
         });
     });
@@ -164,7 +155,7 @@ describe('DynamoDBAdapter', function () {
             // Mock the UpdateCommand
             mockClient.send.onSecondCall().resolves({ Attributes: {} });
 
-            await adapter.update('id', '1', 'status', 'new');
+            await adapter.update('id', '1', 'status', 'new', 'test-table');
             expect(mockClient.send.calledTwice).to.be.true;
         });
     });
@@ -176,7 +167,7 @@ describe('DynamoDBAdapter', function () {
             });
             mockClient.send.onSecondCall().resolves({ Attributes: {} });
 
-            await adapter.listAppend('id', '1', 'items', { name: 'new' });
+            await adapter.listAppend('id', '1', 'items', { name: 'new' }, 'test-table');
             expect(mockClient.send.calledTwice).to.be.true;
         });
     });
@@ -241,14 +232,14 @@ describe('DynamoDBAdapter', function () {
                 Count: 50,
                 LastEvaluatedKey: undefined,
             });
-            const count = await adapter.countItems();
+            const count = await adapter.countItems('test-table');
             expect(count).to.equal(150);
             expect(mockClient.send.calledTwice).to.be.true;
         });
 
         it('should handle single page', async () => {
             mockClient.send.resolves({ Count: 25 });
-            const count = await adapter.countItems();
+            const count = await adapter.countItems('test-table');
             expect(count).to.equal(25);
         });
     });
@@ -257,7 +248,7 @@ describe('DynamoDBAdapter', function () {
         it('should propagate errors from put', async () => {
             mockClient.send.rejects(new Error('DynamoDB error'));
             try {
-                await adapter.put({ id: '1' });
+                await adapter.put({ id: '1' }, 'test-table');
                 expect.fail('should have thrown');
             } catch (e) {
                 expect(e.message).to.equal('DynamoDB error');
@@ -267,7 +258,7 @@ describe('DynamoDBAdapter', function () {
         it('should propagate errors from get', async () => {
             mockClient.send.rejects(new Error('DynamoDB error'));
             try {
-                await adapter.get('id', '1');
+                await adapter.get('id', '1', 'test-table');
                 expect.fail('should have thrown');
             } catch (e) {
                 expect(e.message).to.equal('DynamoDB error');

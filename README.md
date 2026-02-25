@@ -69,7 +69,7 @@ Saico separates construction from activation:
 const agent = new Saico({
     name: 'agent',
     prompt: 'System prompt here',
-    dynamodb_table: 'my_data',  // optional DB
+    dynamodb: { region: 'us-east-1', credentials: { accessKeyId: 'AK', secretAccessKey: 'SK' } },
 });
 
 // DB methods work before activation
@@ -189,8 +189,10 @@ new Saico({
     // Storage
     redis: true,               // Set false to skip Redis proxy
     key: 'custom-redis-key',
-    dynamodb_table: 'table',   // Auto-creates DynamoDB adapter
-    dynamodb_region: 'us-east-1',
+    dynamodb: {                // DynamoDB config (creates adapter)
+        region: 'us-east-1',
+        credentials: { accessKeyId: '...', secretAccessKey: '...' },
+    },
     db: customAdapter,         // Any adapter with put/get/delete/query interface
 
     // User data
@@ -240,26 +242,26 @@ await agent.closeSession();  // Close context and cancel task
 
 ## Database Access
 
-Saico provides backend-agnostic DB methods. Configure via `dynamodb_table` (auto-creates DynamoDB adapter) or `db` (any adapter implementing the interface).
+Saico provides backend-agnostic DB methods. Configure via `opt.dynamodb` (auto-creates DynamoDB adapter) or `opt.db` (any adapter). Table name is required on every call. Child Saico instances without their own DB inherit the parent's adapter automatically via `_getDb()`.
 
 ```js
-// CRUD
-await agent.dbPutItem({ id: '123', name: 'test' });
-const item = await agent.dbGetItem('id', '123');
-await agent.dbDeleteItem('id', '123');
-const items = await agent.dbQuery('email-index', 'email', 'user@test.com');
-const all = await agent.dbGetAll();
+// CRUD — table name required on every call
+await agent.dbPutItem({ id: '123', name: 'test' }, 'my-table');
+const item = await agent.dbGetItem('id', '123', 'my-table');
+await agent.dbDeleteItem('id', '123', 'my-table');
+const items = await agent.dbQuery('email-index', 'email', 'user@test.com', 'my-table');
+const all = await agent.dbGetAll('my-table');
 
 // Updates
-await agent.dbUpdate('id', '123', 'status', 'active');
-await agent.dbUpdatePath('id', '123', [{ key: 'nested' }], 'field', 'value');
-await agent.dbListAppend('id', '123', 'tags', 'new-tag');
+await agent.dbUpdate('id', '123', 'status', 'active', 'my-table');
+await agent.dbUpdatePath('id', '123', [{ key: 'nested' }], 'field', 'value', 'my-table');
+await agent.dbListAppend('id', '123', 'tags', 'new-tag', 'my-table');
 
 // Counters
-const nextId = await agent.dbNextCounterId('OrderId');
-const count = await agent.dbGetCounterValue('OrderId');
-await agent.dbSetCounterValue('OrderId', 100);
-const total = await agent.dbCountItems();
+const nextId = await agent.dbNextCounterId('OrderId', 'counters');
+const count = await agent.dbGetCounterValue('OrderId', 'counters');
+await agent.dbSetCounterValue('OrderId', 100, 'counters');
+const total = await agent.dbCountItems('my-table');
 ```
 
 Override `_deserializeRecord(raw)` to transform raw DB records on retrieval (e.g., restore class instances):

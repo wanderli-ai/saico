@@ -33,9 +33,7 @@ class Saico {
      * @param {string} [opt.key] - Redis key override (default: 'saico:<id>')
      * @param {boolean} [opt.redis=true] - Set false to skip Redis proxy
      * @param {boolean} [opt.isolate] - Isolate: don't aggregate from ancestors
-     * @param {string} [opt.dynamodb_table] - DynamoDB table name (enables db accessor)
-     * @param {string} [opt.dynamodb_region] - AWS region for DynamoDB
-     * @param {Object} [opt.dynamodb_client] - Injectable DynamoDB client (for testing)
+     * @param {Object} [opt.dynamodb] - DynamoDB config { region, credentials: { accessKeyId, secretAccessKey }, client }
      * @param {Object} [opt.db] - Pluggable DB backend
      * @param {Object} [opt.store] - Store instance override
      * @param {Object} [opt.userData] - Initial user data
@@ -68,12 +66,12 @@ class Saico {
 
         // DB backend — pluggable storage adapter.
         this._db = opt.db || null;
-        if (!this._db && opt.dynamodb_table) {
+        if (!this._db && opt.dynamodb) {
             const { DynamoDBAdapter } = require('./dynamo.js');
             this._db = new DynamoDBAdapter({
-                table: opt.dynamodb_table,
-                region: opt.dynamodb_region,
-                client: opt.dynamodb_client,
+                region: opt.dynamodb.region,
+                credentials: opt.dynamodb.credentials,
+                client: opt.dynamodb.client,
             });
         }
 
@@ -446,76 +444,90 @@ class Saico {
 
     // ---- Generic DB access ----
 
+    /**
+     * Find a DB backend — own _db first, then walk UP the parent Saico chain.
+     * Throws if no backend found anywhere.
+     */
+    _getDb() {
+        if (this._db) return this._db;
+        let task = this._task?.parent;
+        while (task) {
+            if (task._saico?._db) return task._saico._db;
+            task = task.parent;
+        }
+        throw new Error('No DB backend configured. Set opt.dynamodb or opt.db on this Saico or an ancestor.');
+    }
+
     async dbPutItem(item, table) {
-        if (!this._db) return;
-        return this._db.put(item, table);
+        const db = this._getDb();
+        return db.put(item, table);
     }
 
     async dbGetItem(key, value, table) {
-        if (!this._db) return;
-        const result = await this._db.get(key, value, table);
+        const db = this._getDb();
+        const result = await db.get(key, value, table);
         return result ? this._deserializeRecord(result) : result;
     }
 
     async dbDeleteItem(key, value, table) {
-        if (!this._db) return;
-        return this._db.delete(key, value, table);
+        const db = this._getDb();
+        return db.delete(key, value, table);
     }
 
     async dbQuery(index, key, value, table) {
-        if (!this._db) return;
-        const results = await this._db.query(index, key, value, table);
+        const db = this._getDb();
+        const results = await db.query(index, key, value, table);
         return Array.isArray(results)
             ? results.map(r => this._deserializeRecord(r))
             : results;
     }
 
     async dbGetAll(table) {
-        if (!this._db) return;
-        const results = await this._db.getAll(table);
+        const db = this._getDb();
+        const results = await db.getAll(table);
         return Array.isArray(results)
             ? results.map(r => this._deserializeRecord(r))
             : results;
     }
 
     async dbUpdate(key, keyValue, setKey, item, table) {
-        if (!this._db) return;
-        return this._db.update(key, keyValue, setKey, item, table);
+        const db = this._getDb();
+        return db.update(key, keyValue, setKey, item, table);
     }
 
     async dbUpdatePath(key, keyValue, path, setKey, item, table) {
-        if (!this._db) return;
-        return this._db.updatePath(key, keyValue, path, setKey, item, table);
+        const db = this._getDb();
+        return db.updatePath(key, keyValue, path, setKey, item, table);
     }
 
     async dbListAppend(key, keyValue, setKey, item, table) {
-        if (!this._db) return;
-        return this._db.listAppend(key, keyValue, setKey, item, table);
+        const db = this._getDb();
+        return db.listAppend(key, keyValue, setKey, item, table);
     }
 
     async dbListAppendPath(key, keyValue, path, setKey, item, table) {
-        if (!this._db) return;
-        return this._db.listAppendPath(key, keyValue, path, setKey, item, table);
+        const db = this._getDb();
+        return db.listAppendPath(key, keyValue, path, setKey, item, table);
     }
 
     async dbNextCounterId(counter, table) {
-        if (!this._db) return;
-        return this._db.nextCounterId(counter, table);
+        const db = this._getDb();
+        return db.nextCounterId(counter, table);
     }
 
     async dbGetCounterValue(counter, table) {
-        if (!this._db) return;
-        return this._db.getCounterValue(counter, table);
+        const db = this._getDb();
+        return db.getCounterValue(counter, table);
     }
 
     async dbSetCounterValue(counter, value, table) {
-        if (!this._db) return;
-        return this._db.setCounterValue(counter, value, table);
+        const db = this._getDb();
+        return db.setCounterValue(counter, value, table);
     }
 
     async dbCountItems(table) {
-        if (!this._db) return;
-        return this._db.countItems(table);
+        const db = this._getDb();
+        return db.countItems(table);
     }
 
     // ---- DB deserialization hook ----

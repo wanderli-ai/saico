@@ -99,7 +99,7 @@ describe('Saico', function () {
             expect(typeof s.lastMod).to.equal('undefined');
         });
 
-        it('should not have _db when no dynamodb_table', () => {
+        it('should not have _db when no dynamodb config', () => {
             const s = new Saico();
             expect(s._db).to.be.null;
         });
@@ -842,7 +842,7 @@ describe('Saico', function () {
             }
             const fakeDb = { get: sandbox.stub().resolves({ id: '1' }) };
             const s = new MyService({ db: fakeDb });
-            const result = await s.dbGetItem('id', '1');
+            const result = await s.dbGetItem('id', '1', 'tbl');
             expect(result.deserialized).to.be.true;
         });
 
@@ -856,7 +856,7 @@ describe('Saico', function () {
                 query: sandbox.stub().resolves([{ id: '1' }, { id: '2' }]),
             };
             const s = new MyService({ db: fakeDb });
-            const results = await s.dbQuery('idx', 'k', 'v');
+            const results = await s.dbQuery('idx', 'k', 'v', 'tbl');
             expect(results).to.have.length(2);
             expect(results[0].deserialized).to.be.true;
             expect(results[1].deserialized).to.be.true;
@@ -872,7 +872,7 @@ describe('Saico', function () {
                 getAll: sandbox.stub().resolves([{ id: '1' }]),
             };
             const s = new MyService({ db: fakeDb });
-            const results = await s.dbGetAll();
+            const results = await s.dbGetAll('tbl');
             expect(results[0].deserialized).to.be.true;
         });
     });
@@ -988,21 +988,32 @@ describe('Saico', function () {
             };
         });
 
-        it('should return undefined when no backend configured', async () => {
+        it('should throw when no backend configured', async () => {
             const s = new Saico();
-            expect(await s.dbPutItem({ id: '1' })).to.be.undefined;
-            expect(await s.dbGetItem('id', '1')).to.be.undefined;
-            expect(await s.dbDeleteItem('id', '1')).to.be.undefined;
-            expect(await s.dbQuery('idx', 'k', 'v')).to.be.undefined;
-            expect(await s.dbGetAll()).to.be.undefined;
-            expect(await s.dbUpdate('id', '1', 'k', 'v')).to.be.undefined;
-            expect(await s.dbUpdatePath('id', '1', [], 'k', 'v')).to.be.undefined;
-            expect(await s.dbListAppend('id', '1', 'k', 'v')).to.be.undefined;
-            expect(await s.dbListAppendPath('id', '1', [], 'k', 'v')).to.be.undefined;
-            expect(await s.dbNextCounterId('c')).to.be.undefined;
-            expect(await s.dbGetCounterValue('c')).to.be.undefined;
-            expect(await s.dbSetCounterValue('c', 1)).to.be.undefined;
-            expect(await s.dbCountItems()).to.be.undefined;
+            try {
+                await s.dbPutItem({ id: '1' }, 'tbl');
+                expect.fail('should have thrown');
+            } catch (e) {
+                expect(e.message).to.include('No DB backend configured');
+            }
+        });
+
+        it('_getDb should search parent chain', async () => {
+            const parent = new Saico({ db: fakeDb });
+            parent.activate();
+            const child = new Saico();
+            child.activate({ parent: parent._task });
+            const item = await child.dbGetItem('id', '1', 'tbl');
+            expect(item).to.deep.equal({ id: '1', name: 'test' });
+            expect(fakeDb.get.calledOnce).to.be.true;
+        });
+
+        it('_getDb should throw when no db in chain', () => {
+            const parent = new Saico();
+            parent.activate();
+            const child = new Saico();
+            child.activate({ parent: parent._task });
+            expect(() => child._getDb()).to.throw('No DB backend configured');
         });
 
         it('dbPutItem should delegate to backend.put', async () => {
@@ -1090,10 +1101,10 @@ describe('Saico', function () {
             expect(count).to.equal(100);
         });
 
-        it('should pass table override to backend', async () => {
+        it('should pass table to backend', async () => {
             const s = new Saico({ db: fakeDb });
-            await s.dbGetItem('id', '1', 'other-table');
-            expect(fakeDb.get.firstCall.args[2]).to.equal('other-table');
+            await s.dbGetItem('id', '1', 'my-table');
+            expect(fakeDb.get.firstCall.args[2]).to.equal('my-table');
         });
 
         it('should work with subclass that has db', () => {

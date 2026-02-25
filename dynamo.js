@@ -3,9 +3,8 @@
 /**
  * DynamoDBAdapter — Generic DynamoDB access layer.
  *
- * Generalized from ../backend/aws.js. Provides CRUD, update, list-append,
- * counter, and scan operations. All methods accept an optional `table`
- * parameter that defaults to `this.defaultTable`.
+ * Provides CRUD, update, list-append, counter, and scan operations.
+ * Table name is required on every call.
  *
  * AWS SDK v3 packages are required only when this module is loaded.
  */
@@ -18,14 +17,16 @@ const { unmarshall, marshall } = require('@aws-sdk/util-dynamodb');
 class DynamoDBAdapter {
     /**
      * @param {Object} opt
-     * @param {string} opt.table - Default table name for all operations
      * @param {string} [opt.region='us-east-1'] - AWS region
+     * @param {Object} [opt.credentials] - AWS credentials { accessKeyId, secretAccessKey }
      * @param {DynamoDBClient} [opt.client] - Injectable DynamoDB client (for testing)
      */
     constructor(opt = {}) {
-        this.defaultTable = opt.table || null;
         this._region = opt.region || 'us-east-1';
-        this._client = opt.client || new DynamoDBClient({ region: this._region });
+        this._client = opt.client || new DynamoDBClient({
+            region: this._region,
+            ...(opt.credentials && { credentials: opt.credentials }),
+        });
         this.__docClient = null;
     }
 
@@ -36,9 +37,8 @@ class DynamoDBAdapter {
     }
 
     _table(table) {
-        const t = table || this.defaultTable;
-        if (!t) throw new Error('DynamoDBAdapter: no table specified');
-        return t;
+        if (!table) throw new Error('DynamoDBAdapter: table name required');
+        return table;
     }
 
     _unmarshall(item) {
