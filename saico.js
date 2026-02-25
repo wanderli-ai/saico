@@ -29,7 +29,6 @@ class Saico {
      * @param {string} [opt.id] - Instance ID (auto-generated if omitted)
      * @param {string} [opt.name] - Instance name (defaults to class name)
      * @param {string} [opt.prompt] - Class-level system prompt
-     * @param {Function} [opt.tool_handler] - Tool handler function
      * @param {Array} [opt.functions] - Available AI functions
      * @param {string} [opt.key] - Redis key override (default: 'saico:<id>')
      * @param {boolean} [opt.redis=true] - Set false to skip Redis proxy
@@ -53,7 +52,6 @@ class Saico {
         // Public configuration
         this.name = opt.name || this.constructor.name || 'saico';
         this.prompt = opt.prompt || '';
-        this.tool_handler = opt.tool_handler || null;
         this.functions = opt.functions || null;
 
         // Absorbed from Sid
@@ -96,7 +94,6 @@ class Saico {
      * @param {Object} opts
      * @param {boolean} [opts.createQ] - If true, attach a message Q (Context)
      * @param {string} [opts.prompt] - Additional prompt (appended to class-level)
-     * @param {Function} [opts.tool_handler] - Override tool handler
      * @param {Array} [opts.functions] - Override functions
      * @param {Array} [opts.states] - Task state functions
      * @param {Itask} [opts.parent] - Parent task to spawn under
@@ -126,7 +123,6 @@ class Saico {
             id: opts.taskId,
             async: true,
             store: this._store,
-            tool_handler: opts.tool_handler || this.tool_handler,
             functions: opts.functions || this.functions,
             bind: this, // State functions run with Saico instance as `this`
         };
@@ -148,7 +144,6 @@ class Saico {
                 max_tool_repetition: opts.max_tool_repetition ?? this.sessionConfig.max_tool_repetition,
                 queue_limit: opts.queue_limit ?? this.sessionConfig.queue_limit,
                 min_chat_messages: opts.min_chat_messages ?? this.sessionConfig.min_chat_messages,
-                tool_handler: taskOpt.tool_handler,
                 functions: taskOpt.functions,
                 sequential_mode: opts.sequential_mode,
                 msgs: opts.msgs,
@@ -334,7 +329,6 @@ class Saico {
                 max_tool_repetition: opt.max_tool_repetition ?? this.sessionConfig.max_tool_repetition,
                 queue_limit: opt.queue_limit ?? this.sessionConfig.queue_limit,
                 min_chat_messages: opt.min_chat_messages ?? this.sessionConfig.min_chat_messages,
-                tool_handler: opt.tool_handler || this.tool_handler,
                 functions: opt.functions || this.functions,
             });
             childTask.setContext(childContext);
@@ -565,7 +559,7 @@ class Saico {
     /**
      * Restore a Saico instance from serialized data.
      * @param {string|Object} data - Serialized data (JSON string or object)
-     * @param {Object} opt - Options (tool_handler, functions, store, states, etc.)
+     * @param {Object} opt - Options (functions, store, states, etc.)
      * @returns {Saico}
      */
     static deserialize(data, opt = {}) {
@@ -578,7 +572,6 @@ class Saico {
             userData: parsed.userData,
             sessionConfig: parsed.sessionConfig,
             isolate: parsed.isolate,
-            tool_handler: opt.tool_handler,
             functions: opt.functions || parsed.task?.context?.functions,
             store: opt.store,
             redis: false, // No Redis proxy during deserialization
@@ -593,7 +586,6 @@ class Saico {
                 taskId: parsed.task.id,
                 tag: parsed.task.context?.tag,
                 chat_history: parsed.task.context?.chat_history,
-                tool_handler: opt.tool_handler,
                 functions: opt.functions || parsed.task.context?.functions,
                 states: opt.states || [],
                 ...opt,

@@ -24,7 +24,6 @@ class Context {
         this.token_limit = config.token_limit || 1000000000;
         this.lower_limit = this.token_limit * 0.85;
         this.upper_limit = this.token_limit * 0.98;
-        this.tool_handler = config.tool_handler || task?.tool_handler;
         this.functions = config.functions || task?.functions || null;
 
         // Recursive depth and repetition control
@@ -63,8 +62,6 @@ class Context {
     // Set the task reference (used when context is created separately)
     setTask(task) {
         this.task = task;
-        if (!this.tool_handler)
-            this.tool_handler = task?.tool_handler;
         if (!this.functions)
             this.functions = task?.functions;
     }
@@ -287,10 +284,9 @@ class Context {
 
                     try {
                         const correspondingDeferred = deferredGroup.find(d => d.call.id === call.id);
-                        const handler = correspondingDeferred?.originalMessage.opts.handler || this.tool_handler;
                         const timeout = correspondingDeferred?.originalMessage.opts.timeout;
 
-                        result = await this._executeToolCallWithTimeout(call, handler, timeout);
+                        result = await this._executeToolCallWithTimeout(call, timeout);
                         if (_snap !== null &&
                             _snap !== JSON.stringify(this._snapshotPublicProps(this.task)))
                             this._appendToolDigest(call.function.name, result?.content || '');
@@ -669,7 +665,7 @@ class Context {
         }
     }
 
-    async _executeToolCallWithTimeout(call, handler, customTimeoutMs = null) {
+    async _executeToolCallWithTimeout(call, customTimeoutMs = null) {
         const timeoutMs = customTimeoutMs || 5000;
 
         return new Promise(async (resolve) => {
@@ -688,7 +684,7 @@ class Context {
             }, timeoutMs);
 
             try {
-                const result = await this.interpretAndApplyChanges(call, handler);
+                const result = await this.interpretAndApplyChanges(call);
 
                 if (!completed) {
                     completed = true;
@@ -1005,7 +1001,7 @@ class Context {
                             ? JSON.stringify(this._snapshotPublicProps(this.task)) : null;
                         try {
                             const result = await this._executeToolCallWithTimeout(
-                                call, o.opts?.handler, o.opts?.timeout);
+                                call, o.opts?.timeout);
                             const item = toolCallsWithResults.find(item => item.call.id === call.id);
                             if (item) item.result = result;
                             if (_snap !== null &&
@@ -1064,27 +1060,84 @@ class Context {
         }
     }
 
-    async interpretAndApplyChanges(call, handler) {
-        _log('apply tool', call.function.name, 'have handler', !!handler, !!this.tool_handler);
+    /**
+     * Search the Saico hierarchy for a TOOL_<toolName> method.
+     * Order: current task → walk UP parents → walk DOWN children (BFS).
+     */
+    _findToolImplementation(toolName) {
+        const methodName = 'TOOL_' + toolName;
+        const check = (task) =>
+            task?._saico && typeof task._saico[methodName] === 'function' ? task._saico : null;
+
+        // 1. Current task
+        let found = check(this.task);
+        if (found) return { saico: found, methodName };
+
+        // 2. Walk UP parent chain
+        let t = this.task?.parent;
+        while (t) {
+            found = check(t);
+            if (found) return { saico: found, methodName };
+            t = t.parent;
+        }
+
+        // 3. Walk DOWN from this.task (BFS)
+        if (this.task) {
+            const queue = [...this.task.child];
+            while (queue.length > 0) {
+                const child = queue.shift();
+                if (child._completed) continue;
+                found = check(child);
+                if (found) return { saico: found, methodName };
+                if (child.child?.size > 0) queue.push(...child.child);
+            }
+        }
+
+        return null;
+    }
+
+    async interpretAndApplyChanges(call) {
         if (!call)
             return { content: '', functions: null };
 
-        _log('invoking function', call.function.name);
-        handler ||= this.tool_handler;
-        let result = await handler(call.function.name, call.function.arguments);
+        const toolName = call.function.name;
+        _log('apply tool', toolName);
+
+        const impl = this._findToolImplementation(toolName);
+        if (!impl) {
+            _log('No TOOL_ method found for:', toolName);
+            return {
+                content: `Error: No implementation found for tool "${toolName}". ` +
+                    `Expected a TOOL_${toolName}(args) method on a Saico instance in the hierarchy.`,
+                functions: null
+            };
+        }
+
+        _log('invoking TOOL_' + toolName, 'on', impl.saico.name || impl.saico.constructor.name);
+
+        let parsedArgs;
+        try {
+            parsedArgs = JSON.parse(call.function.arguments);
+        } catch (e) {
+            return {
+                content: `Error: Failed to parse arguments for tool "${toolName}": ${e.message}`,
+                functions: null
+            };
+        }
+
+        let result = await impl.saico[impl.methodName](parsedArgs);
 
         let content = result?.content || result || '';
         let functions = result?.functions || null;
 
         if (content && typeof content !== 'string')
             content = JSON.stringify(content);
-        else if (!content)
-        {
-            content = `tool call ${call.function.name} ${call.id} completed. do not reply. wait for the next msg `
-                +`from the user`;
+        else if (!content) {
+            content = `tool call ${toolName} ${call.id} completed. do not reply. wait for the next msg `
+                + `from the user`;
         }
 
-        _log('FUNCTION RESULT', call.function.name, call.id, content.substring(0, 50) + '...',
+        _log('FUNCTION RESULT', toolName, call.id, content.substring(0, 50) + '...',
             functions ? 'with functions' : 'no functions');
         return { content, functions };
     }

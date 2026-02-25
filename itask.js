@@ -110,7 +110,6 @@ function Itask(opt, states){
     // Store options for context creation (prompt, functions, etc.)
     this.prompt = opt.prompt;
     this.functions = opt.functions;
-    this.tool_handler = opt.tool_handler;
 
     // register root if no explicit spawn_parent provided
     // If opt.spawn_parent provided, spawn under it

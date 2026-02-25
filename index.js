@@ -54,7 +54,6 @@ async function init(config = {}) {
  * @param {Object|string} opt - Task options or name string
  * @param {string} opt.name - Task name
  * @param {string} opt.prompt - System prompt (if provided, creates a context)
- * @param {Function} opt.tool_handler - Tool handler function
  * @param {Array} opt.functions - Available functions for AI
  * @param {boolean} opt.cancel - Whether task is cancelable
  * @param {Object} opt.bind - Bind context for state functions
@@ -80,7 +79,6 @@ function createTask(opt, states = []) {
             token_limit: opt.token_limit,
             max_depth: opt.max_depth,
             max_tool_repetition: opt.max_tool_repetition,
-            tool_handler: opt.tool_handler,
             functions: opt.functions,
             sequential_mode: opt.sequential_mode
         });
@@ -99,11 +97,10 @@ function createTask(opt, states = []) {
  * @param {string} tag - Context tag identifier
  * @param {number} token_limit - Token limit for summarization
  * @param {Array} msgs - Initial messages
- * @param {Function} tool_handler - Tool handler function
  * @param {Object} config - Additional configuration
  * @returns {Context} Proxied Context instance
  */
-function createQ(prompt, parent, tag, token_limit, msgs, tool_handler, config = {}) {
+function createQ(prompt, parent, tag, token_limit, msgs, config = {}) {
     // For backward compatibility, if parent is a Context, get its task
     let task = null;
     if (parent && parent.task) {
@@ -114,7 +111,6 @@ function createQ(prompt, parent, tag, token_limit, msgs, tool_handler, config = 
         tag,
         token_limit,
         msgs,
-        tool_handler,
         ...config
     });
 

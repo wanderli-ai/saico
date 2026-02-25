@@ -12,7 +12,6 @@ const util = require('../util.js');
 
 describe('Context', function () {
     let sandbox;
-    let mockToolHandler;
     const fakePrompt = 'You are a helpful assistant.';
     const fakeTokenLimit = 1000;
 
@@ -25,7 +24,6 @@ describe('Context', function () {
             return 10;
         });
         sandbox.stub(openai, 'send').resolves({ content: 'AI response' });
-        mockToolHandler = sandbox.stub().resolves({ content: 'tool result', functions: null });
         Itask.root.clear();
         Store.instance = null;
     });
@@ -261,11 +259,20 @@ describe('Context', function () {
 
     describe('tool calls', () => {
         let ctx;
+        let mockSaico;
 
         beforeEach(() => {
-            ctx = createContext(fakePrompt, null, {
-                tool_handler: mockToolHandler
-            });
+            const task = new Itask({ name: 'tool-test', async: true }, []);
+            mockSaico = {
+                name: 'test-saico',
+                TOOL_test_tool: sandbox.stub().resolves({ content: 'tool result', functions: null }),
+                TOOL_slow_tool: sandbox.stub().returns(new Promise(resolve => {
+                    setTimeout(() => resolve({ content: 'slow result' }), 6000);
+                })),
+            };
+            task._saico = mockSaico;
+            ctx = createContext(fakePrompt, task, {});
+            task.setContext(ctx);
         });
 
         it('should handle basic tool calls', async () => {
@@ -286,8 +293,8 @@ describe('Context', function () {
 
             const reply = await ctx.sendMessage('user', 'Test message', null, {});
 
-            expect(mockToolHandler.calledOnce).to.be.true;
-            expect(mockToolHandler.firstCall.args[0]).to.equal('test_tool');
+            expect(mockSaico.TOOL_test_tool.calledOnce).to.be.true;
+            expect(mockSaico.TOOL_test_tool.firstCall.args[0]).to.deep.equal({ param: 'value' });
             expect(reply.content).to.include('I will help you');
         });
 
@@ -413,16 +420,12 @@ describe('Context', function () {
         });
 
         it('should handle tool call timeouts', async () => {
-            const slowHandler = sandbox.stub().returns(new Promise(resolve => {
-                setTimeout(() => resolve({ content: 'slow result' }), 6000);
-            }));
-
             const call = {
                 id: 'call_123',
                 function: { name: 'slow_tool', arguments: '{}' }
             };
 
-            const result = await ctx._executeToolCallWithTimeout(call, slowHandler, 100);
+            const result = await ctx._executeToolCallWithTimeout(call, 100);
             expect(result.content).to.include('timed out');
         });
     });

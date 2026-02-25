@@ -14,7 +14,6 @@ const redis = require('../redis.js');
 
 describe('Saico', function () {
     let sandbox;
-    let mockToolHandler;
     const fakePrompt = 'You are a helpful assistant.';
 
     beforeEach(() => {
@@ -26,7 +25,6 @@ describe('Saico', function () {
             return 10;
         });
         sandbox.stub(openai, 'send').resolves({ content: 'AI response' });
-        mockToolHandler = sandbox.stub().resolves({ content: 'tool result', functions: null });
         Itask.root.clear();
         Store.instance = null;
         // Ensure redis.rclient is null for most tests (no redis proxy)
@@ -47,7 +45,6 @@ describe('Saico', function () {
             expect(s._task).to.be.null;
             expect(s.name).to.equal('Saico');
             expect(s.prompt).to.equal('');
-            expect(s.tool_handler).to.be.null;
             expect(s.functions).to.be.null;
             expect(s._db).to.be.null;
             expect(s.userData).to.deep.equal({});
@@ -57,13 +54,11 @@ describe('Saico', function () {
         });
 
         it('should accept options', () => {
-            const handler = () => {};
             const funcs = [{ name: 'test' }];
             const s = new Saico({
                 id: 'my-id',
                 name: 'my-service',
                 prompt: fakePrompt,
-                tool_handler: handler,
                 functions: funcs,
                 userData: { key: 'val' },
                 isolate: true,
@@ -71,7 +66,6 @@ describe('Saico', function () {
             expect(s._id).to.equal('my-id');
             expect(s.name).to.equal('my-service');
             expect(s.prompt).to.equal(fakePrompt);
-            expect(s.tool_handler).to.equal(handler);
             expect(s.functions).to.equal(funcs);
             expect(s.userData).to.deep.equal({ key: 'val' });
             expect(s._isolate).to.be.true;
@@ -177,21 +171,11 @@ describe('Saico', function () {
             expect(s.context.prompt).to.equal('');
         });
 
-        it('should pass tool_handler and functions to task', () => {
-            const handler = sandbox.stub();
+        it('should pass functions to task', () => {
             const funcs = [{ name: 'f1' }];
-            const s = new Saico({ tool_handler: handler, functions: funcs });
+            const s = new Saico({ functions: funcs });
             s.activate();
-            expect(s._task.tool_handler).to.equal(handler);
             expect(s._task.functions).to.deep.equal(funcs);
-        });
-
-        it('should allow overriding tool_handler and functions on activate', () => {
-            const handler1 = sandbox.stub();
-            const handler2 = sandbox.stub();
-            const s = new Saico({ tool_handler: handler1 });
-            s.activate({ tool_handler: handler2 });
-            expect(s._task.tool_handler).to.equal(handler2);
         });
 
         it('should bind Saico instance as this for state functions', () => {
@@ -260,10 +244,10 @@ describe('Saico', function () {
         });
 
         it('should bubble cleaned messages to parent context', async () => {
-            const parent = new Saico({ name: 'parent', tool_handler: mockToolHandler });
+            const parent = new Saico({ name: 'parent' });
             parent.activate({ createQ: true });
 
-            const child = new Saico({ name: 'child', tool_handler: mockToolHandler });
+            const child = new Saico({ name: 'child' });
             child.activate({ createQ: true, parent: parent._task });
 
             // Add some messages to child
@@ -306,7 +290,7 @@ describe('Saico', function () {
         it('should build preamble and pass to context', async () => {
             const s = new Saico({
                 prompt: fakePrompt,
-                tool_handler: mockToolHandler,
+
             });
             s.activate({ createQ: true });
 
@@ -323,7 +307,7 @@ describe('Saico', function () {
             class MyApp extends Saico {
                 getStateSummary() { return 'my state'; }
             }
-            const app = new MyApp({ prompt: 'test', tool_handler: mockToolHandler });
+            const app = new MyApp({ prompt: 'test' });
             app.activate({ createQ: true });
 
             await app.sendMessage('hello');
@@ -336,7 +320,7 @@ describe('Saico', function () {
         });
 
         it('should include tool digest from context in preamble', async () => {
-            const s = new Saico({ prompt: 'test', tool_handler: mockToolHandler });
+            const s = new Saico({ prompt: 'test' });
             s.activate({ createQ: true });
             s.context._appendToolDigest('myTool', 'tool result');
 
@@ -352,7 +336,7 @@ describe('Saico', function () {
         it('should aggregate functions from Saico and pass via opts', async () => {
             const s = new Saico({
                 prompt: 'test',
-                tool_handler: mockToolHandler,
+
                 functions: [{ name: 'func1' }],
             });
             s.activate({ createQ: true });
@@ -368,7 +352,7 @@ describe('Saico', function () {
             const parent = new Saico({
                 name: 'parent',
                 prompt: 'Parent prompt',
-                tool_handler: mockToolHandler,
+
                 functions: [{ name: 'parent_func' }],
             });
             parent.activate({ createQ: true });
@@ -376,7 +360,7 @@ describe('Saico', function () {
             const child = new Saico({
                 name: 'child',
                 prompt: 'Child prompt',
-                tool_handler: mockToolHandler,
+
                 functions: [{ name: 'child_func' }],
             });
             child.activate({ createQ: true, parent: parent._task });
@@ -401,7 +385,7 @@ describe('Saico', function () {
             const parent = new Saico({
                 name: 'parent',
                 prompt: 'Parent prompt',
-                tool_handler: mockToolHandler,
+
                 functions: [{ name: 'parent_func' }],
             });
             parent.activate({ createQ: true });
@@ -409,7 +393,7 @@ describe('Saico', function () {
             const child = new Saico({
                 name: 'child',
                 prompt: 'Child prompt',
-                tool_handler: mockToolHandler,
+
                 functions: [{ name: 'child_func' }],
                 isolate: true,
             });
@@ -449,7 +433,7 @@ describe('Saico', function () {
         it('should route to own context', async () => {
             const s = new Saico({
                 prompt: fakePrompt,
-                tool_handler: mockToolHandler,
+
             });
             s.activate({ createQ: true });
             const reply = await s.recvChatMessage('hello');
@@ -460,7 +444,7 @@ describe('Saico', function () {
             const parent = new Saico({
                 name: 'parent',
                 prompt: 'Parent prompt',
-                tool_handler: mockToolHandler,
+
             });
             parent.activate({ createQ: true });
 
@@ -483,7 +467,7 @@ describe('Saico', function () {
             const parent = new Saico({
                 name: 'parent',
                 prompt: 'Parent prompt',
-                tool_handler: mockToolHandler,
+
             });
             parent.activate({ createQ: true });
 
@@ -552,7 +536,7 @@ describe('Saico', function () {
 
     describe('_getStateSummary', () => {
         it('should include recent messages when context is not the active Q', () => {
-            const parent = new Saico({ name: 'parent', tool_handler: mockToolHandler });
+            const parent = new Saico({ name: 'parent' });
             parent.activate({ createQ: true });
 
             parent.context._msgs.push(
@@ -575,7 +559,7 @@ describe('Saico', function () {
         });
 
         it('should NOT include recent messages when context IS the active Q', () => {
-            const s = new Saico({ name: 'test', tool_handler: mockToolHandler });
+            const s = new Saico({ name: 'test' });
             s.activate({ createQ: true });
 
             s.context._msgs.push(
@@ -725,7 +709,7 @@ describe('Saico', function () {
         it('should be activatable after subclass construction', () => {
             class MyService extends Saico {
                 constructor() {
-                    super({ prompt: 'Base prompt', tool_handler: () => {} });
+                    super({ prompt: 'Base prompt' });
                 }
             }
 
@@ -796,9 +780,7 @@ describe('Saico', function () {
             original.context.push({ role: 'user', content: 'Hello' });
 
             const serialized = original.serialize();
-            const restored = Saico.deserialize(serialized, {
-                tool_handler: mockToolHandler,
-            });
+            const restored = Saico.deserialize(serialized);
 
             expect(restored._id).to.equal('test-id');
             expect(restored.name).to.equal('test');
@@ -902,7 +884,7 @@ describe('Saico', function () {
         });
 
         it('should create child task with context', () => {
-            const s = new Saico({ tool_handler: mockToolHandler });
+            const s = new Saico();
             s.activate();
             const child = s.spawnTaskWithContext({
                 name: 'child',

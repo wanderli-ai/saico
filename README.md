@@ -27,7 +27,6 @@ class MyAgent extends Saico {
         super({
             name: 'my-agent',
             prompt: 'You are a helpful assistant.',
-            tool_handler: (name, args) => this.handleTool(name, args),
             functions: [{
                 type: 'function',
                 function: {
@@ -43,11 +42,9 @@ class MyAgent extends Saico {
         });
     }
 
-    async handleTool(name, argsString) {
-        const args = JSON.parse(argsString);
-        if (name === 'get_weather')
-            return `Weather in ${args.location}: 72F, sunny`;
-        return 'Unknown tool';
+    // Tool implementations — define TOOL_ prefix methods
+    async TOOL_get_weather(args) {
+        return `Weather in ${args.location}: 72F, sunny`;
     }
 }
 
@@ -145,7 +142,6 @@ When a Saico's context is not the deepest active one, its last 5 user/assistant 
 const child = agent.spawnTaskWithContext({
     name: 'subtask',
     prompt: 'Handle this specific sub-task',
-    tool_handler: (name, args) => handleSubTools(name, args),
     functions: [/* child-specific tools */]
 }, [
     async function main() {
@@ -177,7 +173,6 @@ new Saico({
 
     // AI config
     prompt: 'System prompt',
-    tool_handler: fn,          // async (name, argsString) => result
     functions: [],             // OpenAI function definitions
 
     // Behavior
@@ -286,7 +281,6 @@ const json = agent.serialize();
 
 // Restore
 const restored = Saico.deserialize(json, {
-    tool_handler: myHandler,
     functions: myFunctions,
 });
 ```
@@ -309,15 +303,25 @@ agent.someProperty = 'value';  // Auto-saved to Redis
 
 Properties prefixed with `_` are internal and not persisted.
 
-## Tool Handler Interface
+## Tool Implementation (TOOL_ methods)
+
+Define tool implementations as `TOOL_`-prefixed methods on your Saico subclass. When the LLM returns a tool call, Context automatically searches the Saico hierarchy (current → up parents → down children) to find and invoke the matching method with parsed arguments.
 
 ```js
-async function toolHandler(toolName, argumentsString) {
-    const args = JSON.parse(argumentsString);
-    // Execute tool logic
-    return result;  // string or { content: string, functions?: [] }
+class MyAgent extends Saico {
+    async TOOL_get_weather(args) {
+        // args is already JSON.parse'd
+        return `Weather in ${args.location}: 72F, sunny`;
+    }
+
+    async TOOL_search(args) {
+        const results = await search(args.query);
+        return { content: JSON.stringify(results), functions: updatedTools };
+    }
 }
 ```
+
+Return a string or `{ content: string, functions?: [] }`.
 
 ### Tool Safety Features
 
@@ -339,13 +343,12 @@ const { createTask, createContext, createQ } = require('saico');
 const task = createTask({
     name: 'my-task',
     prompt: 'You are helpful',
-    tool_handler: handler,
     functions: tools
 });
 const reply = await task.sendMessage('Hello');
 
 // Standalone context (legacy)
-const ctx = createQ('System prompt', null, 'tag', 4000, null, handler);
+const ctx = createQ('System prompt', null, 'tag', 4000);
 const reply = await ctx.sendMessage('user', 'Hello', functions);
 ```
 
@@ -371,7 +374,7 @@ saico/
 npm test
 ```
 
-294 tests covering Saico lifecycle, task hierarchy, message handling, tool calls, DB adapters, serialization, and integration flows.
+293 tests covering Saico lifecycle, task hierarchy, message handling, tool calls, DB adapters, serialization, and integration flows.
 
 ## Requirements
 

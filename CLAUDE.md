@@ -90,6 +90,8 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
 4. **msgs.js** - Conversation context with message handling (renamed from context.js)
    - Message queue management with Proxy wrapper
    - Tool call handling (depth control, deferred execution, duplicate detection)
+   - `_findToolImplementation(toolName)` — searches Saico hierarchy (up then down) for `TOOL_<name>` method
+   - `interpretAndApplyChanges(call)` — finds matching `TOOL_` method, JSON.parses args, invokes
    - Message queueing for pending tool calls
    - Summarization support
    - `_createMsgQ(preamble, add_tag, tag_filter)` — when preamble is provided (by Saico), it is prepended as-is and does NOT count against QUEUE_LIMIT. Otherwise falls back to standalone behavior (own prompt + tool digest)
@@ -139,7 +141,7 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
 
 **Task Hierarchy**: Parent-child relationship where:
 - Tasks can have contexts attached (optional)
-- Child tasks inherit tool_handler and functions from parents
+- Child tasks inherit functions from parents; `TOOL_` methods are discovered by searching the Saico hierarchy
 - `findDeepestContext()` walks down to find the deepest active descendant with a context
 
 **Message Flow (Saico orchestration)**:
@@ -189,7 +191,7 @@ Saico A (root, with Context)
 ```js
 {
   msg: { role, content, name?, tool_call_id?, tool_calls? },
-  opts: { summary?, noreply?, nofunc?, handler?, timeout?, _preamble?, _aggregatedFunctions? },
+  opts: { summary?, noreply?, nofunc?, timeout?, _preamble?, _aggregatedFunctions? },
   msgid: String,
   replied: 0 | 1 | 3  // 0=pending, 1=user sent, 3=AI replied
 }
@@ -207,7 +209,6 @@ class MyAgent extends Saico {
             name: 'my-agent',
             prompt: 'You are a helpful assistant.',
             dynamodb_table: 'my_data',
-            tool_handler: (name, args) => this.handleTool(name, args),
             functions: [{ name: 'lookup', ... }],
             userData: { userId },
         });
@@ -226,7 +227,11 @@ class MyAgent extends Saico {
         return `Active user: ${this.getUserData('userId')}`;
     }
 
-    async handleTool(name, args) { /* ... */ }
+    // Tool implementations — TOOL_ prefix + tool name
+    async TOOL_lookup(args) {
+        const result = await this.dbGetItem('id', args.id);
+        return result ? JSON.stringify(result) : 'Not found';
+    }
 }
 
 const agent = new MyAgent('user-123');
@@ -262,7 +267,6 @@ const total = await this.dbCountItems();
 const session = new Saico({
     name: 'my-session',
     prompt: 'You are a helpful assistant',
-    tool_handler: async (name, args) => { /* ... */ },
     functions: [{ name: 'myFunc', ... }],
     userData: { userId: '123' },
     sessionConfig: { max_depth: 3, queue_limit: 50 },
@@ -320,7 +324,7 @@ isolated.activate({ createQ: true, parent: parentSaico._task });
 ```javascript
 const { createQ } = require('saico');
 
-const ctx = createQ('You are a helpful assistant', null, 'my-tag', 1000, null, toolHandler);
+const ctx = createQ('You are a helpful assistant', null, 'my-tag', 1000);
 const reply = await ctx.sendMessage('user', 'Hello', functions);
 ```
 
@@ -330,9 +334,7 @@ const reply = await ctx.sendMessage('user', 'Hello', functions);
 const serialized = session.serialize();
 
 // Restore session
-const restored = Saico.deserialize(serialized, {
-    tool_handler: myHandler
-});
+const restored = Saico.deserialize(serialized);
 ```
 
 **DB deserialization hook**:
@@ -346,16 +348,21 @@ class MyService extends Saico {
 }
 ```
 
-### Tool Handler Interface
+### Tool Implementation (TOOL_ methods)
 
-Tool handlers should follow this pattern:
+Tool implementations are defined as methods on Saico subclasses with a `TOOL_` prefix. When the LLM returns a tool call (e.g., `get_weather`), Context searches the Saico hierarchy (up and down) for a `TOOL_get_weather(args)` method and invokes it with the parsed arguments object.
+
 ```js
-async function toolHandler(toolName, argumentsString) {
-  const args = JSON.parse(argumentsString);
-  // Execute tool logic
-  return result; // string or { content: string, functions?: [] }
+class MyAgent extends Saico {
+    async TOOL_get_weather(args) {
+        // args is already parsed (JSON.parse'd)
+        const weather = await fetchWeather(args.location);
+        return weather;  // string or { content: string, functions?: [] }
+    }
 }
 ```
+
+Search order: current Saico → walk UP parents → walk DOWN children (BFS). First match wins.
 
 ### File Structure
 

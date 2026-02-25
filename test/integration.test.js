@@ -11,7 +11,6 @@ const util = require('../util.js');
 
 describe('Integration Tests', function () {
     let sandbox;
-    let mockToolHandler;
 
     beforeEach(() => {
         sandbox = sinon.createSandbox();
@@ -22,7 +21,6 @@ describe('Integration Tests', function () {
             return 10;
         });
         sandbox.stub(openai, 'send').resolves({ content: 'AI response' });
-        mockToolHandler = sandbox.stub().resolves({ content: 'tool result', functions: null });
         Itask.root.clear();
         Store.instance = null;
     });
@@ -72,7 +70,7 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'You are a helpful assistant.',
-                tool_handler: mockToolHandler,
+
             });
             session.activate({ createQ: true });
 
@@ -104,7 +102,7 @@ describe('Integration Tests', function () {
                 name: 'session',
                 prompt: 'Root prompt',
                 functions: [parentFunc],
-                tool_handler: mockToolHandler,
+
             });
             session.activate({ createQ: true });
 
@@ -129,7 +127,7 @@ describe('Integration Tests', function () {
             const root = new Saico({
                 name: 'root',
                 prompt: 'Level 0',
-                tool_handler: mockToolHandler,
+
             });
             root.activate({ createQ: true });
 
@@ -161,7 +159,7 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler,
+
             });
             session.activate({ createQ: true });
 
@@ -185,8 +183,8 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler,
             });
+            session.TOOL_test_tool = sandbox.stub().resolves({ content: 'tool result', functions: null });
             session.activate({ createQ: true });
 
             const toolCallReply = {
@@ -206,22 +204,23 @@ describe('Integration Tests', function () {
 
             const reply = await session.sendMessage('Use a tool');
 
-            expect(mockToolHandler.calledOnce).to.be.true;
+            expect(session.TOOL_test_tool.calledOnce).to.be.true;
+            expect(session.TOOL_test_tool.firstCall.args[0]).to.deep.equal({ action: 'test' });
             expect(reply.content).to.include('Calling tool');
         });
 
-        it('should inherit tool handler from parent', async () => {
+        it('should find TOOL_ method from parent Saico', async () => {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler,
             });
+            session.TOOL_child_tool = sandbox.stub().resolves({ content: 'tool result', functions: null });
             session.activate({ createQ: true });
 
             const child = session.spawnTaskWithContext({
                 name: 'child',
                 prompt: 'Child prompt',
-                // No tool_handler specified - should inherit from session
+                // No TOOL_ method on child — should find on parent Saico
             }, []);
 
             const toolCallReply = {
@@ -241,13 +240,13 @@ describe('Integration Tests', function () {
 
             await child.sendMessage('Use tool from child');
 
-            expect(mockToolHandler.calledOnce).to.be.true;
+            expect(session.TOOL_child_tool.calledOnce).to.be.true;
         });
     });
 
     describe('Legacy createQ Compatibility', () => {
         it('should work with createQ factory function', async () => {
-            const ctx = createQ('Test prompt', null, 'test-tag', 1000, null, mockToolHandler);
+            const ctx = createQ('Test prompt', null, 'test-tag', 1000, null);
 
             expect(ctx.prompt).to.equal('Test prompt');
             expect(ctx.tag).to.equal('test-tag');
@@ -276,7 +275,7 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler,
+
             });
             session.activate({ createQ: true });
 
@@ -358,7 +357,7 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler,
+
             });
             session.activate({ createQ: true });
 
@@ -380,7 +379,7 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler,
+
             });
             session.activate({ createQ: true });
 
@@ -410,7 +409,7 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler,
+
             });
             session.activate({ createQ: true });
 
@@ -428,7 +427,7 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler,
+
             });
             session.activate({ createQ: true });
 
@@ -443,13 +442,11 @@ describe('Integration Tests', function () {
         });
 
         it('should handle tool handler errors', async () => {
-            const errorHandler = sandbox.stub().rejects(new Error('Tool failed'));
-
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: errorHandler,
             });
+            session.TOOL_failing_tool = sandbox.stub().rejects(new Error('Tool failed'));
             session.activate({ createQ: true });
 
             const toolCallReply = {
@@ -504,7 +501,7 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler,
+
             });
             session.activate({ createQ: true });
 
@@ -520,7 +517,7 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler,
+
             });
             session.activate({ createQ: true });
 
@@ -623,13 +620,11 @@ describe('Integration Tests', function () {
                 name: 'session',
                 prompt: 'Session prompt',
             });
-            session.activate({ createQ: true });
-
-            const dirtyHandler = sandbox.stub().callsFake(async () => {
+            session.TOOL_dirty_tool = sandbox.stub().callsFake(async () => {
                 session.userData = { updated: true }; // mutates a non-_ property
                 return { content: 'dirty result' };
             });
-            session.context.tool_handler = dirtyHandler;
+            session.activate({ createQ: true });
 
             const toolCallReply = {
                 content: 'Calling tool',
@@ -653,11 +648,9 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler,
             });
+            session.TOOL_normal_tool = sandbox.stub().resolves({ content: 'regular result' });
             session.activate({ createQ: true });
-
-            mockToolHandler.resolves({ content: 'regular result' });
 
             const toolCallReply = {
                 content: 'Calling tool',
@@ -679,7 +672,7 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler,
+
             });
             session.activate({ createQ: true });
 
@@ -703,7 +696,7 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler,
+
             });
             session.activate({ createQ: true });
             session.context.QUEUE_LIMIT = 10;
@@ -733,7 +726,7 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'persist-session',
                 prompt: 'Session prompt',
-                tool_handler: mockToolHandler,
+
             });
             session.activate({ createQ: true });
 
