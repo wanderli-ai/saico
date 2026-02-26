@@ -294,11 +294,13 @@ Itask.prototype._run = async function _run(){
                     c._oncomplete.push(() => resolve());
                 }
             }));
-            const timeout = new Promise((resolve) => setTimeout(() => {
+            let timer;
+            const timeout = new Promise((resolve) => timer = setTimeout(() => {
                 _ldbg(`[ITASK ${this.name}] Timeout waiting for children after ${timeoutMs}ms, forcing completion`);
                 resolve();
             }, timeoutMs));
             await Promise.race([Promise.all(childPromises), timeout]);
+            clearTimeout(timer);
         } catch (e) { lerr.perr(e); }
         _ldbg(`[ITASK ${this.name}] Done waiting for children`);
     }
@@ -438,12 +440,14 @@ Itask.prototype._ecancel = function _ecancel(arg){
                             c._oncomplete.push(() => resolve());
                         }
                     }));
-                    const timeout = new Promise((resolve) => setTimeout(() => {
+                    let timer;
+                    const timeout = new Promise((resolve) => timer = setTimeout(() => {
                         _ldbg(`[ITASK ${this.name}] Timeout waiting for children after ${timeoutMs}ms, `+
                             `forcing completion`);
                         resolve();
                     }, timeoutMs));
                     await Promise.race([Promise.all(childPromises), timeout]);
+                    clearTimeout(timer);
                 } catch (e) { lerr.perr(e); }
                 _ldbg(`[ITASK ${this.name}] Done waiting for children`);
             }

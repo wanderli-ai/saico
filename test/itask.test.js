@@ -202,6 +202,69 @@ describe('Itask', function () {
             expect(task.error.message).to.equal('cancelled');
         });
 
+        it('should clear child-wait timeout in _ecancel when task is not running', async () => {
+            // Parent: async, never starts running — _ecancel takes the !running path
+            const parent = new Itask({ name: 'parent', async: true }, []);
+            // Child: auto-runs using setImmediate loop (no Timeout resources)
+            // so timer count changes are only from the leaked/cleared child-wait timeout
+            const child = new Itask({ name: 'child' }, [
+                async function() {
+                    const end = Date.now() + 200;
+                    while (Date.now() < end)
+                        await new Promise(r => setImmediate(r));
+                    return 'done';
+                }
+            ]);
+            parent.child_completion_timeout = 2000;
+
+            parent.spawn(child);
+            await new Promise(resolve => setTimeout(resolve, 20));
+
+            const timersBefore = process.getActiveResourcesInfo().filter(r => r === 'Timeout').length;
+
+            // child is running (setImmediate loop), parent never ran
+            parent._ecancel();
+            // Wait for child to finish (200ms) + buffer, but NOT for the 2s timer
+            await new Promise(resolve => setTimeout(resolve, 400));
+
+            // No extra timers should remain — the 2s child-wait timer must be cleared
+            const timersAfter = process.getActiveResourcesInfo().filter(r => r === 'Timeout').length;
+            expect(timersAfter).to.be.at.most(timersBefore);
+        });
+
+        it('should clear child-wait timeout in _run when children complete first', async () => {
+            // Use async:true to prevent auto-start, so we can yield first
+            const parent = new Itask({ name: 'parent', async: true }, [
+                async function main() {
+                    // Child uses setImmediate loop (no Timeout resources)
+                    // so timer count changes are only from the leaked/cleared child-wait timeout
+                    const child = new Itask({ name: 'child', async: true }, [
+                        async function() {
+                            const end = Date.now() + 50;
+                            while (Date.now() < end)
+                                await new Promise(r => setImmediate(r));
+                            return 'done';
+                        }
+                    ]);
+                    this.spawn(child);
+                    return 'parent done';
+                }
+            ]);
+            parent.child_completion_timeout = 2000;
+
+            // Yield to let mocha set its test timeout, then measure baseline
+            await new Promise(r => setImmediate(r));
+            const timersBefore = process.getActiveResourcesInfo().filter(r => r === 'Timeout').length;
+
+            parent._run();
+            await parent;
+            await new Promise(resolve => setTimeout(resolve, 100));
+
+            // No extra timers should remain — the 2s child-wait timer must be cleared
+            const timersAfter = process.getActiveResourcesInfo().filter(r => r === 'Timeout').length;
+            expect(timersAfter).to.be.at.most(timersBefore);
+        });
+
         it('should cancel child tasks', async () => {
             const parent = new Itask({ name: 'parent', async: true }, [
                 function() { return this.wait(); }
