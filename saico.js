@@ -37,6 +37,7 @@ class Saico {
      * @param {Array} [opt.functions] - Available AI functions
      * @param {string} [opt.key] - Redis key override (default: 'saico:<id>')
      * @param {boolean} [opt.redis=true] - Set false to skip Redis proxy
+     * @param {boolean} [opt.createQ] - Create message Q context on activate()
      * @param {boolean} [opt.isolate] - Isolate: don't aggregate from ancestors
      * @param {Object} [opt.dynamodb] - DynamoDB config { region, credentials: { accessKeyId, secretAccessKey }, client }
      * @param {Object} [opt.db] - Pluggable DB backend
@@ -60,6 +61,7 @@ class Saico {
         this.name = opt.name || this.constructor.name || 'saico';
         this.prompt = opt.prompt || '';
         this.functions = opt.functions || null;
+        this.createQ = opt.createQ || false;
 
         // Absorbed from Sid
         this.userData = opt.userData || {};
@@ -99,10 +101,10 @@ class Saico {
      * Create the internal Itask and optionally a message Q context.
      *
      * @param {Object} opts
-     * @param {boolean} [opts.createQ] - If true, attach a message Q (Context)
+     * @param {boolean} [opts.createQ] - Override this.createQ for this activation
      * @param {string} [opts.prompt] - Additional prompt (appended to class-level)
      * @param {Array} [opts.functions] - Override functions
-     * @param {Array} [opts.states] - Task state functions
+     * @param {Array} [opts.states] - Override this.states for this activation
      * @param {string} [opts.taskId] - Custom task ID
      * @param {number} [opts.token_limit] - Token limit for context
      * @param {number} [opts.max_depth] - Max tool call depth
@@ -119,7 +121,7 @@ class Saico {
         if (this._task)
             throw new Error('Already activated. Call deactivate() first.');
 
-        const states = opts.states || [];
+        const states = opts.states || this.states || [];
 
         // Build effective prompt: class-level + activation-level
         const effectivePrompt = [this.prompt, opts.prompt].filter(Boolean).join('\n');
@@ -136,8 +138,8 @@ class Saico {
         // Store Saico reference on task for parent chain traversal
         this._task._saico = this;
 
-        // Create message Q context if requested (only via createQ flag, NOT prompt)
-        if (opts.createQ) {
+        // Create message Q context if requested (class-level or activate-level)
+        if (opts.createQ ?? this.createQ) {
             const functions = opts.functions || this.functions;
             const contextConfig = {
                 tag: opts.tag || this._task.id,

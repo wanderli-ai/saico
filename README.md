@@ -69,14 +69,15 @@ Saico separates construction from activation:
 const agent = new Saico({
     name: 'agent',
     prompt: 'System prompt here',
+    createQ: true,  // message Q created on activate()
     dynamodb: { region: 'us-east-1', credentials: { accessKeyId: 'AK', secretAccessKey: 'SK' } },
 });
 
 // DB methods work before activation
 const item = await agent.dbGetItem('id', '123');
 
-// 2. Activate — creates internal task + optional message queue context
-agent.activate({ createQ: true });
+// 2. Activate — creates internal task + message Q (from this.createQ)
+agent.activate();
 
 // 3. Use — send messages, spawn children
 await agent.sendMessage('Do something');
@@ -84,6 +85,23 @@ await agent.recvChatMessage('User says hello');
 
 // 4. Deactivate — bubbles cleaned messages to parent, closes context
 await agent.deactivate();
+```
+
+Subclasses can also define `this.states` (task functions) in the constructor — `activate()` picks them up automatically:
+
+```js
+class MyAgent extends Saico {
+    constructor() {
+        super({ name: 'agent', prompt: 'You are helpful', createQ: true });
+        this.states = [
+            async function main() {
+                return await this.sendMessage('Starting...');
+            }
+        ];
+    }
+}
+const agent = new MyAgent();
+agent.activate();  // no params needed — uses this.createQ and this.states
 ```
 
 ### Message Orchestration
@@ -177,6 +195,7 @@ new Saico({
     // AI config
     prompt: 'System prompt',
     functions: [],             // OpenAI function definitions
+    createQ: false,            // Create message Q on activate() (also settable as this.createQ)
 
     // Behavior
     isolate: false,            // Stop ancestor aggregation
@@ -207,9 +226,9 @@ new Saico({
 
 ```js
 agent.activate({
-    createQ: true,             // Create message queue context
+    createQ: true,             // Override this.createQ for this activation
     prompt: 'Extra prompt',    // Appended to class-level prompt
-    states: [],                // Task state functions
+    states: [],                // Override this.states for this activation
     taskId: 'custom-id',
     sequential_mode: true,     // Process messages sequentially
 

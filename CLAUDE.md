@@ -61,7 +61,9 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - External users extend this instead of Itask
    - Constructor returns Redis observable proxy when Redis is available
    - **Context ownership**: `this.context` and `this.context_id` live directly on Saico (not on Itask)
-   - `activate(opts)` creates internal Itask; `opts.createQ` flag attaches message Q context
+   - `activate(opts)` creates internal Itask and optional message Q context
+   - `createQ` can be set via constructor opts, subclass property, or `activate({ createQ })` override
+   - `states` (task functions) can be set as `this.states` on the class or via `activate({ states })` override
    - `opts.prompt` appends to class-level prompt (NOT a trigger for context creation)
    - **sendMessage orchestration**: walks Saico parent chain to build preamble (prompts, state summaries, tool digests) and aggregated functions, passes to Context via `_preamble` and `_aggregatedFunctions` opts
    - **recvChatMessage routing**: routes DOWN to deepest descendant with a msg Q
@@ -131,8 +133,8 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
 ### Key Patterns
 
 **Saico Lifecycle**: Separate construction from activation:
-- `new Saico(opt)` — creates instance with Redis proxy + DB access. No Itask yet.
-- `instance.activate({ createQ: true })` — creates internal Itask + optional message Q context
+- `new Saico(opt)` — creates instance with Redis proxy + DB access. No Itask yet. `opt.createQ` and `this.states` can be set here.
+- `instance.activate()` — creates internal Itask + optional message Q context (uses `this.createQ` and `this.states` from class)
 - `instance.deactivate()` — bubbles cleaned messages to parent, closes context, cancels task
 - `instance.closeSession()` — closes context and cancels task
 - DB methods (`dbGetItem`, etc.) work before and after activation
@@ -216,18 +218,27 @@ class MyAgent extends Saico {
         super({
             name: 'my-agent',
             prompt: 'You are a helpful assistant.',
+            createQ: true,  // message Q created on activate()
             dynamodb: { region: 'us-east-1', credentials: { accessKeyId: 'AK', secretAccessKey: 'SK' } },
             functions: [{ name: 'lookup', ... }],
             userData: { userId },
         });
+
+        // States defined on the class — activate() picks them up automatically
+        this.states = [
+            async function main() {
+                const user = await this.dbGetItem('id', this.getUserData('userId'));
+                return await this.sendMessage(`User ${user.name} loaded`);
+            }
+        ];
     }
 
     async start() {
         // DB works BEFORE activate
         const user = await this.dbGetItem('id', this.getUserData('userId'));
 
-        // activate creates Itask + message Q
-        this.activate({ createQ: true, prompt: `User: ${this.getUserData('userId')}` });
+        // activate creates Itask + message Q (from this.createQ) with states (from this.states)
+        this.activate({ prompt: `User: ${this.getUserData('userId')}` });
         return this;
     }
 

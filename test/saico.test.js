@@ -190,6 +190,59 @@ describe('Saico', function () {
             expect(s._task.funcs).to.have.lengthOf(1);
         });
 
+        it('should use this.states when opts.states not provided', () => {
+            const stateFn = sandbox.stub();
+            class MyAgent extends Saico {
+                constructor() {
+                    super();
+                    this.states = [stateFn];
+                }
+            }
+            const agent = new MyAgent();
+            agent.activate();
+            expect(agent._task.funcs).to.have.lengthOf(1);
+            expect(agent._task.funcs[0]).to.equal(stateFn);
+        });
+
+        it('should prefer opts.states over this.states', () => {
+            const classFn = sandbox.stub();
+            const optsFn = sandbox.stub();
+            class MyAgent extends Saico {
+                constructor() {
+                    super();
+                    this.states = [classFn];
+                }
+            }
+            const agent = new MyAgent();
+            agent.activate({ states: [optsFn] });
+            expect(agent._task.funcs).to.have.lengthOf(1);
+            expect(agent._task.funcs[0]).to.equal(optsFn);
+        });
+
+        it('should use this.createQ from constructor opts', () => {
+            const s = new Saico({ prompt: 'test', createQ: true });
+            s.activate();
+            expect(s.context).to.be.instanceOf(Context);
+        });
+
+        it('should prefer opts.createQ over this.createQ', () => {
+            const s = new Saico({ prompt: 'test', createQ: true });
+            s.activate({ createQ: false });
+            expect(s.context).to.be.null;
+        });
+
+        it('should allow subclass to set createQ in constructor', () => {
+            class MyAgent extends Saico {
+                constructor() {
+                    super({ prompt: 'test' });
+                    this.createQ = true;
+                }
+            }
+            const agent = new MyAgent();
+            agent.activate();
+            expect(agent.context).to.be.instanceOf(Context);
+        });
+
         it('should pass context config options', () => {
             const s = new Saico();
             s.activate({
