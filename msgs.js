@@ -92,18 +92,30 @@ class Context {
             this.tool_digest = this.tool_digest.slice(-this.TOOL_DIGEST_LIMIT);
     }
 
-    // Get the parent context by traversing task hierarchy
+    // Get the parent context by traversing task hierarchy (via Saico)
     getParentContext() {
         if (!this.task || !this.task.parent)
             return null;
-        return this.task.parent.findContext ? this.task.parent.findContext() : null;
+        let task = this.task.parent;
+        while (task) {
+            if (task._saico?.context) return task._saico.context;
+            task = task.parent;
+        }
+        return null;
     }
 
-    // Get all ancestor contexts via task hierarchy
+    // Get all ancestor contexts via task hierarchy (via Saico)
     getAncestorContexts() {
         if (!this.task)
             return [];
-        return this.task.getAncestorContexts().filter(ctx => ctx !== this);
+        const contexts = [];
+        let task = this.task.parent;
+        while (task) {
+            if (task._saico?.context)
+                contexts.unshift(task._saico.context);
+            task = task.parent;
+        }
+        return contexts;
     }
 
     _hasPendingToolCalls() {
@@ -1145,7 +1157,7 @@ class Context {
     // Spawn child context (creates a child task with its own context)
     spawnChild(prompt, tag, config = {}) {
         if (!this.task) {
-            // If no task, create a standalone context (legacy mode)
+            // If no task, create a standalone context
             return createContext(prompt, null, { ...config, tag });
         }
 
@@ -1153,14 +1165,16 @@ class Context {
         const Itask = require('./itask.js');
         const childTask = new Itask({
             name: tag || 'child-context',
-            prompt,
             async: true,
-            spawn_parent: this.task,
-            contextConfig: config
         }, []);
+        this.task.spawn(childTask);
 
         const childContext = new Context(prompt, childTask, { ...config, tag });
-        childTask.setContext(childContext);
+        // Store context on Saico if present, otherwise just set on task reference
+        if (childTask._saico) {
+            childTask._saico.context = childContext;
+            childTask._saico.context_id = childContext.tag;
+        }
 
         return childContext;
     }

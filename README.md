@@ -135,29 +135,32 @@ class OrderAgent extends Saico {
 
 When a Saico's context is not the deepest active one, its last 5 user/assistant messages are also included in the state summary automatically.
 
-### Spawning Child Tasks
+### Spawning Child Saico Instances
 
 ```js
 // Child with its own conversation context
-const child = agent.spawnTaskWithContext({
+const child = new Saico({
     name: 'subtask',
     prompt: 'Handle this specific sub-task',
-    functions: [/* child-specific tools */]
-}, [
-    async function main() {
-        return await this.sendMessage('Working on subtask...');
-    }
-]);
+    functions: [/* child-specific tools */],
+});
+child.activate({ createQ: true });
+agent.spawn(child);
+await child.sendMessage('Working on subtask...');
 
-// Child without context (uses parent's)
-const simple = agent.spawnTask({ name: 'simple' }, [
-    async function main() {
-        await this.sendMessage('Quick operation');
-    }
-]);
+// Child without context (uses parent's via findContext())
+const simple = new Saico({ name: 'simple' });
+simple.activate();
+agent.spawn(simple);
+await simple.sendMessage('Quick operation');
+
+// spawnAndRun: spawn + schedule child task to run on nextTick
+const runner = new Saico({ name: 'runner' });
+runner.activate({ states: [async function() { return await this.sendMessage('Go'); }] });
+agent.spawnAndRun(runner);
 ```
 
-Child tasks inherit `sessionConfig` defaults (token_limit, max_depth, etc.) from the parent Saico.
+Both parent and child must be activated before calling `spawn()` or `spawnAndRun()`.
 
 ### Deactivation and Message Bubbling
 
@@ -207,7 +210,6 @@ agent.activate({
     createQ: true,             // Create message queue context
     prompt: 'Extra prompt',    // Appended to class-level prompt
     states: [],                // Task state functions
-    parent: parentTask,        // Parent task to spawn under
     taskId: 'custom-id',
     sequential_mode: true,     // Process messages sequentially
 
@@ -336,21 +338,13 @@ Return a string or `{ content: string, functions?: [] }`.
 
 ## Low-Level API
 
-For cases where you don't need the Saico master class:
+For cases where you need a standalone context without the Saico master class:
 
 ```js
-const { createTask, createContext, createQ } = require('saico');
+const { createContext } = require('saico');
 
-// Create a task with context
-const task = createTask({
-    name: 'my-task',
-    prompt: 'You are helpful',
-    functions: tools
-});
-const reply = await task.sendMessage('Hello');
-
-// Standalone context (legacy)
-const ctx = createQ('System prompt', null, 'tag', 4000);
+// Standalone context
+const ctx = createContext('System prompt', null, { tag: 'my-tag', token_limit: 4000 });
 const reply = await ctx.sendMessage('user', 'Hello', functions);
 ```
 
@@ -358,11 +352,10 @@ const reply = await ctx.sendMessage('user', 'Hello', functions);
 
 ```
 saico/
-+-- index.js      # Entry point, exports all components
-+-- saico.js      # Saico master class
-+-- itask.js      # Base task class (hierarchy, states, cancellation)
++-- index.js      # Thin barrel file, exports all components
++-- saico.js      # Saico master class — owns context, spawn, DB, orchestration
++-- itask.js      # Pure task runner — hierarchy, states, cancellation, promises
 +-- msgs.js       # Conversation context (message queue, tool calls, summarization)
-+-- context.js    # Backward-compat shim for msgs.js
 +-- dynamo.js     # DynamoDB storage adapter
 +-- store.js      # Storage abstraction (Redis + pluggable backends)
 +-- openai.js     # OpenAI API wrapper with retry logic
@@ -376,7 +369,7 @@ saico/
 npm test
 ```
 
-293 tests covering Saico lifecycle, task hierarchy, message handling, tool calls, DB adapters, serialization, and integration flows.
+284 tests covering Saico lifecycle, context ownership, spawn/spawnAndRun, task hierarchy, message handling, tool calls, DB adapters, serialization, and integration flows.
 
 ## Requirements
 

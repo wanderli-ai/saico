@@ -1,6 +1,6 @@
 {
   "name": "saico",
-  "version": "2.6.1",
+  "version": "2.7.0",
   "main": "index.js",
   "type": "commonjs",
   "description": "Hierarchical AI Conversation Orchestrator - Task hierarchy with conversation contexts",
@@ -15,7 +15,6 @@
   "files": [
     "index.js",
     "itask.js",
-    "context.js",
     "msgs.js",
     "saico.js",
     "dynamo.js",

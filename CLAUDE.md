@@ -49,18 +49,18 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
 +---------------------------------------------------------------------+
 ```
 
-1. **index.js** - Main entry point exporting all classes and factory functions
+1. **index.js** - Thin barrel file exporting all classes
    - `Saico` - Master class (external users extend this)
    - `DynamoDBAdapter` - DynamoDB storage adapter
    - `Itask` - Base task class
    - `Context` - Conversation context class
-   - `createTask()` - Factory for tasks with optional context
    - `createContext()` - Factory for standalone contexts
-   - `createQ()` - Legacy compatibility factory
+   - `init()` - Store/Redis initialization
 
 2. **saico.js** - Master class for building AI-powered services
    - External users extend this instead of Itask
    - Constructor returns Redis observable proxy when Redis is available
+   - **Context ownership**: `this.context` and `this.context_id` live directly on Saico (not on Itask)
    - `activate(opts)` creates internal Itask; `opts.createQ` flag attaches message Q context
    - `opts.prompt` appends to class-level prompt (NOT a trigger for context creation)
    - **sendMessage orchestration**: walks Saico parent chain to build preamble (prompts, state summaries, tool digests) and aggregated functions, passes to Context via `_preamble` and `_aggregatedFunctions` opts
@@ -70,7 +70,8 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - `_getDb()` searches up parent Saico chain when no local `_db`; throws if none found
    - DB retrieval methods (`dbGetItem`, `dbQuery`, `dbGetAll`) call `_deserializeRecord()` hook
    - `opt.dynamodb = { region, credentials }` auto-creates DynamoDBAdapter; `opt.db` accepts any adapter
-   - Child spawning: `spawnTaskWithContext()`, `spawnTask()` — inherit `sessionConfig` defaults
+   - Child spawning: `spawn(child)` and `spawnAndRun(child)` — both parent and child must be activated Saico instances
+   - Context methods: `setContext()`, `findContext()`, `findDeepestContext()`, `closeContext()`
    - Overridable `getStateSummary()` hook
    - `getRecentMessages(n)` — user/assistant messages (no tool calls, no BACKEND)
    - `_getStateSummary(activeCtx)` — includes recent messages when context is not the active Q
@@ -78,15 +79,16 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - User data: `userData`, `setUserData()`, `getUserData()`, `clearUserData()`
    - Session info: `getSessionInfo()`, `closeSession()`, `sessionConfig`
    - Serialization: `serialize()`, `static Saico.deserialize()`
+   - `Saico.BACKEND_EXPLANATION` — static text appended to context prompts
 
-3. **itask.js** - Base task class for hierarchical task management
+3. **itask.js** - Pure task runner for hierarchical task management
    - Named state parsing (try, catch, finally, cancel)
    - Parent-child task hierarchy (Set-based children)
    - Cooperative cancellation
    - Promise/thenable interface
-   - Context support for AI conversations
-   - `sendMessage()` delegates to context hierarchy
-   - `findDeepestContext()` walks DOWN to find deepest active descendant with a context
+   - `spawn()` to attach child tasks
+   - All tasks register as root; parent set via `itask.spawn()`
+   - No context/message handling — that lives on Saico
 
 4. **msgs.js** - Conversation context with message handling (renamed from context.js)
    - Message queue management with Proxy wrapper
@@ -98,7 +100,7 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - `_createMsgQ(preamble, add_tag, tag_filter)` — when preamble is provided (by Saico), it is prepended as-is and does NOT count against QUEUE_LIMIT. Otherwise falls back to standalone behavior (own prompt + tool digest)
    - `_processSendMessage` uses `_preamble` and `_aggregatedFunctions` from opts when available
    - `getFunctions()` aggregates from ancestor contexts (standalone fallback)
-   - `context.js` still exists as a backward-compatibility shim re-exporting from `msgs.js`
+   - `context.js` shim has been removed; import directly from `msgs.js`
 
 5. **dynamo.js** - DynamoDB storage adapter (generalized from backend/aws.js)
    - `DynamoDBAdapter` class with full CRUD: `put`, `get`, `delete`, `query`, `getAll`
@@ -143,10 +145,12 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
 - Any adapter implementing the same interface (put/get/delete/query/getAll/update/updatePath/listAppend/listAppendPath/nextCounterId/getCounterValue/setCounterValue/countItems) can be used
 
 **Task Hierarchy**: Parent-child relationship where:
-- Tasks can have contexts attached (optional)
-- Child tasks inherit functions from parents; `TOOL_` methods are discovered by searching the Saico hierarchy
+- Contexts are owned by Saico instances (not by Itask)
+- Child Saico instances are spawned via `parent.spawn(child)` (both must be activated)
+- `TOOL_` methods are discovered by searching the Saico hierarchy via `task._saico`
 - Child Saico instances inherit DB access from parents via `_getDb()` parent chain search
-- `findDeepestContext()` walks down to find the deepest active descendant with a context
+- `findContext()` walks UP via `task._saico?.context` to find nearest context
+- `findDeepestContext()` walks DOWN via `task.child` checking `child._saico?.context`
 
 **Message Flow (Saico orchestration)**:
 ```
@@ -292,26 +296,29 @@ session.getSessionInfo();  // { id, name, running, completed, messageCount, ... 
 await session.closeSession();
 ```
 
-**Spawning Child Tasks**:
+**Spawning Child Saico Instances**:
 ```javascript
-// Task with its own context (inherits sessionConfig defaults)
-const childTask = session.spawnTaskWithContext({
+// Child with its own context
+const child = new Saico({
     name: 'subtask',
-    prompt: 'Handling a specific sub-task'
-}, [
-    async function main() {
-        return await this.sendMessage('Working...');
-    }
-]);
+    prompt: 'Handling a specific sub-task',
+});
+child.activate({ createQ: true });
+session.spawn(child);  // attaches child under parent's task hierarchy
 
-// Task without context (uses parent's context)
-const simpleTask = session.spawnTask({
-    name: 'simple'
-}, [
-    async function() {
-        await this.sendMessage('Quick operation');
-    }
-]);
+// Send message from child (preamble aggregated from parent chain)
+await child.sendMessage('Working...');
+
+// Child without context (uses parent's context via findContext())
+const simple = new Saico({ name: 'simple' });
+simple.activate();
+session.spawn(simple);
+await simple.sendMessage('Quick operation');  // finds parent's context
+
+// spawnAndRun: spawn + schedule child._task._run() on nextTick
+const runner = new Saico({ name: 'runner' });
+runner.activate({ states: [async function() { return await this.sendMessage('Go'); }] });
+session.spawnAndRun(runner);
 ```
 
 **Isolate (stop ancestor aggregation)**:
@@ -321,15 +328,8 @@ const isolated = new Saico({
     prompt: 'Independent agent prompt',
     isolate: true,  // parent prompts/tools/digests not included
 });
-isolated.activate({ createQ: true, parent: parentSaico._task });
-```
-
-**Legacy createQ (backward compatibility)**:
-```javascript
-const { createQ } = require('saico');
-
-const ctx = createQ('You are a helpful assistant', null, 'my-tag', 1000);
-const reply = await ctx.sendMessage('user', 'Hello', functions);
+isolated.activate({ createQ: true });
+parentSaico.spawn(isolated);
 ```
 
 **Serialization**:
@@ -372,11 +372,10 @@ Search order: current Saico → walk UP parents → walk DOWN children (BFS). Fi
 
 ```
 /saico
-+-- index.js          # Main entry point (exports Saico, DynamoDBAdapter, Itask, Context, etc.)
-+-- saico.js          # Master class (extend this)
-+-- itask.js          # Base task class
-+-- msgs.js           # Message/conversation context (renamed from context.js)
-+-- context.js        # Backward-compat shim re-exporting from msgs.js
++-- index.js          # Thin barrel file (exports Saico, DynamoDBAdapter, Itask, Context, etc.)
++-- saico.js          # Master class (extend this) — owns context, spawn, DB, orchestration
++-- itask.js          # Pure task runner — hierarchy, states, cancellation, promises
++-- msgs.js           # Message/conversation context
 +-- dynamo.js         # DynamoDB storage adapter
 +-- store.js          # Store abstraction (Redis + backends)
 +-- openai.js         # OpenAI wrapper
@@ -385,7 +384,7 @@ Search order: current Saico → walk UP parents → walk DOWN children (BFS). Fi
 +-- test/
     +-- saico.test.js       # Saico class tests
     +-- dynamo.test.js      # DynamoDB adapter tests
-    +-- itask.test.js       # Task hierarchy tests
+    +-- itask.test.js       # Pure task hierarchy tests
     +-- context.test.js     # Message handling tests
     +-- integration.test.js # Full hierarchy flow tests
 ```
@@ -393,10 +392,10 @@ Search order: current Saico → walk UP parents → walk DOWN children (BFS). Fi
 ### Testing Framework
 
 Uses Mocha with Chai and Sinon for:
-- Saico class lifecycle, DB delegation, subclass extension, Redis proxy, sendMessage orchestration, recvChatMessage routing, preamble building, opt.isolate, deactivate bubbling, userData, sessionConfig, serialize/deserialize, DB deserialize hook, closeSession, getSessionInfo (saico.test.js)
+- Saico class lifecycle, context ownership, spawn/spawnAndRun, DB delegation, subclass extension, Redis proxy, sendMessage orchestration, recvChatMessage routing, preamble building, opt.isolate, deactivate bubbling, userData, sessionConfig, serialize/deserialize, DB deserialize hook, closeSession, getSessionInfo (saico.test.js)
 - DynamoDB adapter with mocked client (dynamo.test.js)
-- Task hierarchy, states, cancellation, findDeepestContext (itask.test.js)
+- Pure task hierarchy, states, cancellation, wait/continue (itask.test.js)
 - Message handling, tool calls, _createMsgQ with preamble support (context.test.js)
-- Full hierarchy message flow, legacy compatibility (integration.test.js)
+- Full hierarchy message flow, tool calls, serialization (integration.test.js)
 
 Test files mock external dependencies (OpenAI API, token counting, DynamoDB client) for isolated unit testing. DB adapter tests inject a mock client via `opt.client`.

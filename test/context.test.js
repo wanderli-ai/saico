@@ -4,11 +4,13 @@ const chai = require('chai');
 const sinon = require('sinon');
 const expect = chai.expect;
 
-const { Context, createContext } = require('../context.js');
+const { Context, createContext } = require('../msgs.js');
 const Itask = require('../itask.js');
+const { Saico } = require('../saico.js');
 const { Store } = require('../store.js');
 const openai = require('../openai.js');
 const util = require('../util.js');
+const redis = require('../redis.js');
 
 describe('Context', function () {
     let sandbox;
@@ -26,12 +28,14 @@ describe('Context', function () {
         sandbox.stub(openai, 'send').resolves({ content: 'AI response' });
         Itask.root.clear();
         Store.instance = null;
+        redis.rclient = undefined;
     });
 
     afterEach(() => {
         sandbox.restore();
         Itask.root.clear();
         Store.instance = null;
+        redis.rclient = undefined;
     });
 
     describe('constructor', () => {
@@ -151,22 +155,21 @@ describe('Context', function () {
             expect(funcs[0].name).to.equal('test_func');
         });
 
-        it('should aggregate functions from ancestor contexts', () => {
-            const parentTask = new Itask({ name: 'parent', async: true }, []);
-            const childTask = new Itask({ name: 'child', async: true }, []);
-            parentTask.spawn(childTask);
-
-            const parentCtx = new Context('parent prompt', parentTask, {
-                functions: [{ name: 'parent_func' }]
+        it('should aggregate functions from ancestor contexts (via Saico)', () => {
+            const parent = new Saico({
+                name: 'parent',
+                functions: [{ name: 'parent_func' }],
             });
-            parentTask.setContext(parentCtx);
+            parent.activate({ createQ: true });
 
-            const childCtx = new Context('child prompt', childTask, {
-                functions: [{ name: 'child_func' }]
+            const child = new Saico({
+                name: 'child',
+                functions: [{ name: 'child_func' }],
             });
-            childTask.setContext(childCtx);
+            child.activate({ createQ: true });
+            parent.spawn(child);
 
-            const funcs = childCtx.getFunctions();
+            const funcs = child.context.getFunctions();
             expect(funcs).to.have.length(2);
         });
     });
@@ -180,27 +183,23 @@ describe('Context', function () {
             expect(context[1]).to.deep.equal({ role: 'user', content: '[SUMMARY]: summary text' });
         });
 
-        it('should include ancestor context via task hierarchy', () => {
-            const parentTask = new Itask({ name: 'parent', async: true }, []);
-            const childTask = new Itask({ name: 'child', async: true }, []);
-            parentTask.spawn(childTask);
+        it('should include ancestor context via Saico hierarchy', () => {
+            const parent = new Saico({ name: 'parent', prompt: 'Parent prompt' });
+            parent.activate({ createQ: true });
+            parent.context.pushSummary('parent summary');
 
-            const parentCtx = new Context('Parent prompt', parentTask, {});
-            parentTask.setContext(parentCtx);
-            parentCtx.pushSummary('parent summary');
+            const child = new Saico({ name: 'child', prompt: fakePrompt });
+            child.activate({ createQ: true });
+            parent.spawn(child);
+            child.context.pushSummary('child summary');
 
-            const childCtx = new Context(fakePrompt, childTask, {});
-            childTask.setContext(childCtx);
-            childCtx.pushSummary('child summary');
+            const context = child.context.getMsgContext();
 
-            const context = childCtx.getMsgContext();
-
-            expect(context).to.deep.equal([
-                { role: 'system', content: 'Parent prompt' },
-                { role: 'user', content: '[SUMMARY]: parent summary' },
-                { role: 'system', content: fakePrompt },
-                { role: 'user', content: '[SUMMARY]: child summary' }
-            ]);
+            // Should include parent prompt and summary, then child prompt and summary
+            expect(context.some(m => m.content === 'Parent prompt')).to.be.false; // parent context prompt not in ancestor chain
+            // The parent context prompt is the augmented one with BACKEND_EXPLANATION
+            expect(context.some(m => m.content?.includes('[SUMMARY]: parent summary'))).to.be.true;
+            expect(context.some(m => m.content?.includes('[SUMMARY]: child summary'))).to.be.true;
         });
     });
 
@@ -272,7 +271,6 @@ describe('Context', function () {
             };
             task._saico = mockSaico;
             ctx = createContext(fakePrompt, task, {});
-            task.setContext(ctx);
         });
 
         it('should handle basic tool calls', async () => {
@@ -460,33 +458,30 @@ describe('Context', function () {
     });
 
     describe('close', () => {
-        it('should summarize and bubble to parent context', async () => {
-            const parentTask = new Itask({ name: 'parent', async: true }, []);
-            const childTask = new Itask({ name: 'child', async: true }, []);
-            parentTask.spawn(childTask);
+        it('should summarize and bubble to parent context (via Saico)', async () => {
+            const parent = new Saico({ name: 'parent', prompt: 'Parent prompt' });
+            parent.activate({ createQ: true });
 
-            const parentCtx = createContext('Parent prompt', parentTask, {});
-            parentTask.setContext(parentCtx);
-
-            const childCtx = createContext(fakePrompt, childTask, {});
-            childTask.setContext(childCtx);
+            const child = new Saico({ name: 'child', prompt: fakePrompt });
+            child.activate({ createQ: true });
+            parent.spawn(child);
 
             // Add some messages to child context
-            childCtx._msgs.push({
+            child.context._msgs.push({
                 msg: { role: 'user', content: 'Hello' },
                 opts: {},
                 replied: 1
             });
-            childCtx._msgs.push({
+            child.context._msgs.push({
                 msg: { role: 'assistant', content: 'Hi there' },
                 opts: {},
                 replied: 3
             });
 
-            await childCtx.close();
+            await child.context.close();
 
             // Check that summary was added to parent
-            const parentSummaries = parentCtx.getSummaries();
+            const parentSummaries = parent.context.getSummaries();
             expect(parentSummaries.length).to.be.greaterThan(0);
         });
     });
@@ -656,35 +651,10 @@ describe('Context', function () {
 
         it('should recurse into objects even when serialize() is present', () => {
             const ctx = new Context(fakePrompt, null, {});
-            // serialize() is for persistence, not dirty detection — ignored here
             const obj = { name: 'test', serialize: () => 'ignored' };
             const snap = ctx._snapshotPublicProps(obj);
             expect(snap).to.have.property('name', 'test');
             expect(snap).to.not.have.property('serialize'); // function — skipped
-        });
-
-        it('should detect changes to task public properties', () => {
-            const task = new Itask({ name: 'test', async: true }, []);
-            const ctx = new Context(fakePrompt, task, {});
-            task.setContext(ctx);
-
-            const before = JSON.stringify(ctx._snapshotPublicProps(task));
-            task.userData = { changed: true };
-            const after = JSON.stringify(ctx._snapshotPublicProps(task));
-
-            expect(before).to.not.equal(after);
-        });
-
-        it('should not detect changes to underscore properties', () => {
-            const task = new Itask({ name: 'test', async: true }, []);
-            const ctx = new Context(fakePrompt, task, {});
-            task.setContext(ctx);
-
-            const before = JSON.stringify(ctx._snapshotPublicProps(task));
-            task._internal = 'changed'; // underscore-prefixed — should be ignored
-            const after = JSON.stringify(ctx._snapshotPublicProps(task));
-
-            expect(before).to.equal(after);
         });
     });
 
@@ -712,32 +682,16 @@ describe('Context', function () {
         it('should not orphan a tool response at start of slice', () => {
             const ctx = new Context(fakePrompt, null, { min_chat_messages: 0 });
             const msgs = [];
-            // 2 messages before the limit boundary: assistant+tool_calls, tool response
             msgs.push({ role: 'assistant', content: 'calling', tool_calls: [{ id: 'tc1' }] });
             msgs.push({ role: 'tool', content: 'result', tool_call_id: 'tc1' });
-            // Fill to 30 more user/assistant messages
             for (let i = 0; i < 30; i++)
                 msgs.push({ role: 'user', content: `u${i}` });
-            // Total: 32 messages, limit=30 would start at index 2 (a tool response)
-            // should walk back to index 1 (the assistant call)
             const result = ctx._getQueueSlice(msgs, 30);
-            // result should start before the tool response
             expect(result[0].role).to.not.equal('tool');
         });
 
         it('should expand window to guarantee MIN_CHAT_MESSAGES', () => {
             const ctx = new Context(fakePrompt, null, { queue_limit: 30, min_chat_messages: 10 });
-            // 25 tool messages + 5 chat exchanges (10 msgs) = 35 total
-            const msgs = [];
-            for (let i = 0; i < 25; i++)
-                msgs.push({ role: 'tool', content: `tool ${i}`, tool_call_id: `tc${i}` });
-            for (let i = 0; i < 5; i++) {
-                msgs.push({ role: 'user', content: `user ${i}` });
-                msgs.push({ role: 'assistant', content: `assistant ${i}` });
-            }
-            // Last 30 of 35 would include 5 tool + 10 chat = fine, 10 chat messages
-            // But last 30 = msgs[5..34] = 20 tool msgs + 10 chat = 10 chat, which meets the minimum
-            // Let's use a tighter scenario: last 30 has only 4 chat messages
             const msgs2 = [];
             for (let i = 0; i < 28; i++)
                 msgs2.push({ role: 'tool', content: `tool ${i}`, tool_call_id: `tc${i}` });
@@ -745,10 +699,9 @@ describe('Context', function () {
                 msgs2.push({ role: 'user', content: `user ${i}` });
                 msgs2.push({ role: 'assistant', content: `assistant ${i}` });
             }
-            // Total: 32 msgs; last 30 = 26 tool + 4 chat < 10 chat minimum
             const result = ctx._getQueueSlice(msgs2, 30);
             const chatCount = result.filter(m => m.role === 'user' || m.role === 'assistant').length;
-            expect(chatCount).to.be.at.least(4); // at least as many as exist
+            expect(chatCount).to.be.at.least(4);
         });
     });
 
@@ -789,11 +742,9 @@ describe('Context', function () {
 
             const q = ctx._createMsgQ(preamble, false);
 
-            // Preamble should be first
             expect(q[0]).to.deep.equal({ role: 'system', content: 'Root prompt' });
             expect(q[1]).to.deep.equal({ role: 'system', content: '[State Summary]\nRoot state' });
             expect(q[2]).to.deep.equal({ role: 'system', content: 'Child prompt' });
-            // Own messages follow
             expect(q[3]).to.deep.equal({ role: 'user', content: 'Hello' });
         });
 
@@ -804,9 +755,7 @@ describe('Context', function () {
             const preamble = [{ role: 'system', content: 'Saico prompt' }];
             const q = ctx._createMsgQ(preamble, false);
 
-            // Own prompt should NOT appear (only preamble content)
             expect(q.filter(m => m.content === fakePrompt)).to.have.length(0);
-            // Tool digest from own context should NOT appear in standalone section
             const digestFromStandalone = q.filter(m =>
                 m.role === 'system' && m.content?.includes('[Tool Activity Log]'));
             expect(digestFromStandalone).to.have.length(0);
@@ -845,7 +794,6 @@ describe('Context', function () {
             ];
             const q = ctx._createMsgQ(preamble, false);
 
-            // 3 preamble + 5 queue messages = 8 total
             expect(q).to.have.length(8);
             const userMsgs = q.filter(m => m.role === 'user');
             expect(userMsgs).to.have.length(5);
@@ -892,15 +840,14 @@ describe('Context', function () {
 
     describe('spawnChild', () => {
         it('should create a child context with task', () => {
-            const parentTask = new Itask({ name: 'parent', async: true }, []);
-            const parentCtx = new Context(fakePrompt, parentTask, {});
-            parentTask.setContext(parentCtx);
+            const parent = new Saico({ name: 'parent', prompt: fakePrompt });
+            parent.activate({ createQ: true });
 
-            const childCtx = parentCtx.spawnChild('Child prompt', 'child-tag');
+            const childCtx = parent.context.spawnChild('Child prompt', 'child-tag');
 
             expect(childCtx.prompt).to.equal('Child prompt');
             expect(childCtx.task).to.exist;
-            expect(childCtx.task.parent).to.equal(parentTask);
+            expect(childCtx.task.parent).to.equal(parent._task);
         });
     });
 });

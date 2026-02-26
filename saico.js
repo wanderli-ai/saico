@@ -4,6 +4,11 @@ const crypto = require('crypto');
 const Itask = require('./itask.js');
 const { Context } = require('./msgs.js');
 const { Store } = require('./store.js');
+const util = require('./util.js');
+
+function makeId(len = 12){
+    return crypto.randomBytes(Math.ceil(len/2)).toString('hex').slice(0, len);
+}
 
 /**
  * Saico — Master class for building AI-powered services.
@@ -46,6 +51,10 @@ class Saico {
         this._store = opt.store || Store.instance || null;
         this._opt = opt;
         this._isolate = opt.isolate || false;
+
+        // Context owned directly by Saico (not Itask)
+        this.context = null;
+        this.context_id = null;
 
         // Public configuration
         this.name = opt.name || this.constructor.name || 'saico';
@@ -94,7 +103,6 @@ class Saico {
      * @param {string} [opts.prompt] - Additional prompt (appended to class-level)
      * @param {Array} [opts.functions] - Override functions
      * @param {Array} [opts.states] - Task state functions
-     * @param {Itask} [opts.parent] - Parent task to spawn under
      * @param {string} [opts.taskId] - Custom task ID
      * @param {number} [opts.token_limit] - Token limit for context
      * @param {number} [opts.max_depth] - Max tool call depth
@@ -120,13 +128,8 @@ class Saico {
             name: this.name,
             id: opts.taskId,
             async: true,
-            store: this._store,
-            functions: opts.functions || this.functions,
             bind: this, // State functions run with Saico instance as `this`
         };
-
-        if (opts.parent)
-            taskOpt.spawn_parent = opts.parent;
 
         this._task = new Itask(taskOpt, states);
 
@@ -135,6 +138,7 @@ class Saico {
 
         // Create message Q context if requested (only via createQ flag, NOT prompt)
         if (opts.createQ) {
+            const functions = opts.functions || this.functions;
             const contextConfig = {
                 tag: opts.tag || this._task.id,
                 token_limit: opts.token_limit ?? this.sessionConfig.token_limit,
@@ -142,7 +146,7 @@ class Saico {
                 max_tool_repetition: opts.max_tool_repetition ?? this.sessionConfig.max_tool_repetition,
                 queue_limit: opts.queue_limit ?? this.sessionConfig.queue_limit,
                 min_chat_messages: opts.min_chat_messages ?? this.sessionConfig.min_chat_messages,
-                functions: taskOpt.functions,
+                functions,
                 sequential_mode: opts.sequential_mode,
                 msgs: opts.msgs,
                 chat_history: opts.chat_history,
@@ -150,13 +154,116 @@ class Saico {
             };
 
             const augmentedPrompt = effectivePrompt
-                ? effectivePrompt + Itask.BACKEND_EXPLANATION
+                ? effectivePrompt + Saico.BACKEND_EXPLANATION
                 : '';
             const context = new Context(augmentedPrompt, this._task, contextConfig);
-            this._task.setContext(context);
+            this.setContext(context);
         }
 
         return this;
+    }
+
+    // ---- Context management (owned by Saico, not Itask) ----
+
+    /**
+     * Set context on this Saico instance.
+     * Generates context_id, sets context.tag, and calls context.setTask().
+     */
+    setContext(context) {
+        this.context = context;
+        // Generate context_id if not already set
+        if (!this.context_id) {
+            if (this._store)
+                this.context_id = this._store.generateId();
+            else if (Store.instance)
+                this.context_id = Store.instance.generateId();
+            else
+                this.context_id = makeId(16);
+        }
+        if (context) {
+            context.tag = this.context_id;
+            if (typeof context.setTask === 'function')
+                context.setTask(this._task);
+        }
+        return this;
+    }
+
+    /**
+     * Find the nearest context walking UP the Saico/task hierarchy.
+     */
+    findContext() {
+        if (this.context) return this.context;
+        let task = this._task?.parent;
+        while (task) {
+            if (task._saico?.context) return task._saico.context;
+            task = task.parent;
+        }
+        return null;
+    }
+
+    /**
+     * Walk DOWN to find the deepest active descendant with a context.
+     */
+    findDeepestContext() {
+        if (!this._task) return this.context || null;
+        let deepest = this.context ? { context: this.context, depth: 0 } : null;
+        const search = (task, depth) => {
+            for (const child of task.child) {
+                if (child._completed) continue;
+                if (child._saico?.context) {
+                    if (!deepest || depth + 1 >= deepest.depth)
+                        deepest = { context: child._saico.context, depth: depth + 1 };
+                }
+                search(child, depth + 1);
+            }
+        };
+        search(this._task, 0);
+        return deepest ? deepest.context : null;
+    }
+
+    /**
+     * Close this Saico's context and bubble summary to parent.
+     */
+    async closeContext() {
+        if (!this.context)
+            return;
+
+        // Clean tool call messages tagged with this context_id
+        if (this.context_id && typeof this.context.cleanToolCallsByTag === 'function')
+            this.context.cleanToolCallsByTag(this.context_id);
+
+        // Filter out tool calls and [BACKEND] messages, compress remaining as chat_history
+        const cleanedMsgs = this.context._msgs.filter(m => {
+            if (m.msg.tool_calls) return false;
+            if (m.msg.role === 'tool') return false;
+            if (typeof m.msg.content === 'string' && m.msg.content.startsWith('[BACKEND]')) return false;
+            return true;
+        }).map(m => m.msg);
+
+        // Trim to last QUEUE_LIMIT before persisting
+        const queueLimit = this.context.QUEUE_LIMIT || 30;
+        const trimmedMsgs = cleanedMsgs.length > queueLimit
+            ? cleanedMsgs.slice(-queueLimit)
+            : cleanedMsgs;
+
+        if (trimmedMsgs.length > 0) {
+            const chat_history = await util.compressMessages(trimmedMsgs);
+            this.context.chat_history = chat_history;
+
+            // Persist to store
+            const store = this._store || Store.instance;
+            if (store && this.context_id) {
+                await store.save(this.context_id, {
+                    chat_history,
+                    tool_digest: this.context.tool_digest || [],
+                    prompt: this.context.prompt,
+                    tag: this.context.tag,
+                    tm_closed: Date.now()
+                });
+            }
+        }
+
+        await this.context.close();
     }
 
     /**
@@ -166,12 +273,12 @@ class Saico {
      */
     async deactivate() {
         if (!this._task) return;
-        if (this._task.context) {
+        if (this.context) {
             // Find parent context to bubble cleaned messages
             let parentTask = this._task.parent;
             let parentCtx = null;
             while (parentTask) {
-                if (parentTask.context) { parentCtx = parentTask.context; break; }
+                if (parentTask._saico?.context) { parentCtx = parentTask._saico.context; break; }
                 parentTask = parentTask.parent;
             }
             if (parentCtx) {
@@ -180,14 +287,43 @@ class Saico {
                     parentCtx.push(msg);
             }
             // Clean tool calls and close context without additional summary bubbling.
-            // We already pushed cleaned messages above — closeContext's own
-            // summarization would double-bubble.
-            if (this._task.context_id && typeof this._task.context.cleanToolCallsByTag === 'function')
-                this._task.context.cleanToolCallsByTag(this._task.context_id);
-            this._task.context = null;
+            if (this.context_id && typeof this.context.cleanToolCallsByTag === 'function')
+                this.context.cleanToolCallsByTag(this.context_id);
+            this.context = null;
+            this.context_id = null;
         }
         this._task._ecancel();
         this._task = null;
+    }
+
+    // ---- Spawn ----
+
+    /**
+     * Spawn a child Saico under this Saico's task hierarchy.
+     * Both parent and child must be activated.
+     * @param {Saico} child - An activated Saico instance
+     * @returns {Saico} the child (for chaining)
+     */
+    spawn(child) {
+        if (!this._task)
+            throw new Error('Not activated. Call activate() first.');
+        if (!(child instanceof Saico) || !child._task)
+            throw new Error('Child must be an activated Saico instance.');
+        this._task.spawn(child._task);
+        return child;
+    }
+
+    /**
+     * Spawn a child Saico and start its task running.
+     * @param {Saico} child - An activated Saico instance
+     * @returns {Saico} the child (for chaining)
+     */
+    spawnAndRun(child) {
+        this.spawn(child);
+        process.nextTick(() => {
+            try { child._task._run(); } catch (e) { console.error(e); }
+        });
+        return child;
     }
 
     // ---- Saico parent chain traversal ----
@@ -260,19 +396,19 @@ class Saico {
             throw new Error('Not activated. Call activate() first.');
 
         // Find the active context (own or walk up)
-        let ctx = this._task.getContext() || this._task.findContext();
+        let ctx = this.findContext();
         if (!ctx)
             throw new Error('No context available');
 
         // Build preamble by walking Saico chain
-        const activeCtx = this._task.findDeepestContext() || ctx;
+        const activeCtx = this.findDeepestContext() || ctx;
         const { preamble, allFunctions } = this._buildPreamble(activeCtx);
 
         // Merge with call-specific functions
         if (functions) allFunctions.push(...(Array.isArray(functions) ? functions : [functions]));
 
         opts = Object.assign({}, opts, {
-            tag: this._task.context_id,
+            tag: this.context_id,
             _preamble: preamble,
             _aggregatedFunctions: allFunctions.length > 0 ? allFunctions : null,
         });
@@ -284,7 +420,7 @@ class Saico {
             throw new Error('Not activated. Call activate() first.');
 
         // Route DOWN to deepest descendant with a msg Q
-        const ctx = this._task.findDeepestContext();
+        const ctx = this.findDeepestContext();
         if (!ctx)
             throw new Error('No context available');
 
@@ -302,62 +438,7 @@ class Saico {
     // ---- Task delegation ----
 
     get task() { return this._task; }
-    get context() { return this._task?.context || null; }
-    get context_id() { return this._task?.context_id || null; }
     get isActive() { return !!this._task && !this._task._completed; }
-
-    spawnTaskWithContext(opt, states) {
-        if (!this._task)
-            throw new Error('Not activated. Call activate() first.');
-        if (typeof opt === 'string')
-            opt = { name: opt };
-
-        const childTask = new Itask({
-            ...opt,
-            spawn_parent: this._task,
-            store: this._store,
-            async: true,
-        }, states || []);
-
-        if (opt.prompt) {
-            const childContext = new Context(opt.prompt, childTask, {
-                tag: opt.tag || childTask.id,
-                token_limit: opt.token_limit ?? this.sessionConfig.token_limit,
-                max_depth: opt.max_depth ?? this.sessionConfig.max_depth,
-                max_tool_repetition: opt.max_tool_repetition ?? this.sessionConfig.max_tool_repetition,
-                queue_limit: opt.queue_limit ?? this.sessionConfig.queue_limit,
-                min_chat_messages: opt.min_chat_messages ?? this.sessionConfig.min_chat_messages,
-                functions: opt.functions || this.functions,
-            });
-            childTask.setContext(childContext);
-        }
-
-        process.nextTick(() => {
-            try { childTask._run(); } catch (e) { console.error(e); }
-        });
-
-        return childTask;
-    }
-
-    spawnTask(opt, states) {
-        if (!this._task)
-            throw new Error('Not activated. Call activate() first.');
-        if (typeof opt === 'string')
-            opt = { name: opt };
-
-        const childTask = new Itask({
-            ...opt,
-            spawn_parent: this._task,
-            store: this._store,
-            async: true,
-        }, states || []);
-
-        process.nextTick(() => {
-            try { childTask._run(); } catch (e) { console.error(e); }
-        });
-
-        return childTask;
-    }
 
     // ---- State Summary ----
 
@@ -437,8 +518,8 @@ class Saico {
 
     async closeSession() {
         if (!this._task) return;
-        if (this._task.context)
-            await this._task.context.close();
+        if (this.context)
+            await this.context.close();
         this._task._ecancel();
     }
 
@@ -555,13 +636,13 @@ class Saico {
         if (this._task) {
             data.task = {
                 id: this._task.id,
-                context_id: this._task.context_id,
-                context: this._task.context ? {
-                    tag: this._task.context.tag,
-                    msgs: this._task.context._msgs,
-                    functions: this._task.context.functions,
-                    chat_history: this._task.context.chat_history,
-                    tool_digest: this._task.context.tool_digest,
+                context_id: this.context_id,
+                context: this.context ? {
+                    tag: this.context.tag,
+                    msgs: this.context._msgs,
+                    functions: this.context.functions,
+                    chat_history: this.context.chat_history,
+                    tool_digest: this.context.tool_digest,
                 } : null,
             };
         }
@@ -604,18 +685,23 @@ class Saico {
             });
 
             // Restore messages to context
-            if (parsed.task.context?.msgs && instance._task.context) {
-                instance._task.context._msgs = parsed.task.context.msgs;
+            if (parsed.task.context?.msgs && instance.context) {
+                instance.context._msgs = parsed.task.context.msgs;
             }
 
             // Restore tool_digest
-            if (Array.isArray(parsed.task.context?.tool_digest) && instance._task.context) {
-                instance._task.context.tool_digest = parsed.task.context.tool_digest;
+            if (Array.isArray(parsed.task.context?.tool_digest) && instance.context) {
+                instance.context.tool_digest = parsed.task.context.tool_digest;
             }
         }
 
         return instance;
     }
 }
+
+// [BACKEND] explanation text appended to context prompts
+Saico.BACKEND_EXPLANATION = '\nNote: Messages prefixed with [BACKEND] are from the backend ' +
+    'server, not the user. They contain server instructions, data updates, or system context. ' +
+    'Treat them as authoritative system-level information.';
 
 module.exports = { Saico };

@@ -5,7 +5,7 @@ const sinon = require('sinon');
 const expect = chai.expect;
 
 const saico = require('../index.js');
-const { Itask, Context, Saico, Store, createTask, createContext, createQ } = saico;
+const { Itask, Context, Saico, Store, createContext } = saico;
 const openai = require('../openai.js');
 const util = require('../util.js');
 
@@ -43,10 +43,13 @@ describe('Integration Tests', function () {
             expect(saico.init).to.be.a('function');
         });
 
-        it('should export factory functions', () => {
-            expect(createTask).to.be.a('function');
+        it('should export createContext factory', () => {
             expect(createContext).to.be.a('function');
-            expect(createQ).to.be.a('function');
+        });
+
+        it('should not export legacy createTask or createQ', () => {
+            expect(saico.createTask).to.be.undefined;
+            expect(saico.createQ).to.be.undefined;
         });
 
         it('should not export Sid or createSid', () => {
@@ -59,42 +62,39 @@ describe('Integration Tests', function () {
             expect(saico.openai).to.exist;
             expect(saico.redis).to.exist;
         });
-
-        it('should wire up Context reference in Itask', () => {
-            expect(Itask.Context).to.equal(Context);
-        });
     });
 
     describe('Hierarchical Message Flow', () => {
-        it('should aggregate messages from task hierarchy', async () => {
+        it('should aggregate messages from Saico hierarchy', async () => {
             const session = new Saico({
                 name: 'session',
                 prompt: 'You are a helpful assistant.',
-
             });
             session.activate({ createQ: true });
 
             // Add summary to session context
             session.context.pushSummary('Previous conversation summary');
 
-            // Create child task with context
-            const childTask = session.spawnTaskWithContext({
+            // Create child Saico with context
+            const child = new Saico({
                 name: 'subtask',
                 prompt: 'You are handling a specific subtask.',
-            }, []);
+            });
+            child.activate({ createQ: true });
+            session.spawn(child);
 
-            // Send message from child — uses Itask.sendMessage (no Saico orchestration)
-            await childTask.sendMessage('Working on subtask');
+            // Send message from child via Saico orchestration
+            await child.sendMessage('Working on subtask');
 
             const sentArgs = openai.send.getCall(0).args[0];
 
-            // child sendMessage uses Context standalone fallback (no preamble)
-            // The child context prompt should be in the queue
+            // Saico orchestration: parent prompt + child prompt in preamble
+            expect(sentArgs.some(m => m.content === 'You are a helpful assistant.')).to.be.true;
             expect(sentArgs.some(m => m.content === 'You are handling a specific subtask.')).to.be.true;
             expect(sentArgs.some(m => m.content === '[BACKEND] Working on subtask')).to.be.true;
         });
 
-        it('should aggregate functions from hierarchy (standalone Context)', async () => {
+        it('should aggregate functions from hierarchy', async () => {
             const parentFunc = { name: 'parent_func', description: 'Parent function' };
             const childFunc = { name: 'child_func', description: 'Child function' };
 
@@ -102,18 +102,19 @@ describe('Integration Tests', function () {
                 name: 'session',
                 prompt: 'Root prompt',
                 functions: [parentFunc],
-
             });
             session.activate({ createQ: true });
 
-            const childTask = session.spawnTaskWithContext({
+            const child = new Saico({
                 name: 'child',
                 prompt: 'Child prompt',
                 functions: [childFunc],
-            }, []);
+            });
+            child.activate({ createQ: true });
+            session.spawn(child);
 
-            // Itask.sendMessage uses Context getFunctions which aggregates from hierarchy
-            await childTask.sendMessage('Test message');
+            // Saico.sendMessage aggregates functions from chain
+            await child.sendMessage('Test message');
 
             const sentFunctions = openai.send.getCall(0).args[1];
             expect(sentFunctions).to.exist;
@@ -127,29 +128,30 @@ describe('Integration Tests', function () {
             const root = new Saico({
                 name: 'root',
                 prompt: 'Level 0',
-
             });
             root.activate({ createQ: true });
 
-            const level1 = root.spawnTaskWithContext({
+            const level1 = new Saico({
                 name: 'level1',
                 prompt: 'Level 1',
-            }, []);
+            });
+            level1.activate({ createQ: true });
+            root.spawn(level1);
 
-            const level2Task = new Itask({
+            const level2 = new Saico({
                 name: 'level2',
-                async: true,
-                spawn_parent: level1,
-            }, []);
-            const level2Ctx = new Context('Level 2', level2Task, {});
-            level2Task.setContext(level2Ctx);
+                prompt: 'Level 2',
+            });
+            level2.activate({ createQ: true });
+            level1.spawn(level2);
 
-            await level2Task.sendMessage('Deep message');
+            await level2.sendMessage('Deep message');
 
             const sentArgs = openai.send.getCall(0).args[0];
 
-            // Context standalone behavior: walks ancestor contexts
-            // We should have Level 2 prompt in the queue
+            // Saico orchestration: all ancestor prompts in preamble
+            expect(sentArgs.some(m => m.content === 'Level 0')).to.be.true;
+            expect(sentArgs.some(m => m.content === 'Level 1')).to.be.true;
             expect(sentArgs.some(m => m.content === 'Level 2')).to.be.true;
         });
     });
@@ -159,20 +161,16 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-
             });
             session.activate({ createQ: true });
 
-            // Spawn a task WITHOUT its own context
-            const simpleTask = session.spawnTask({
-                name: 'simple',
-            }, [
-                async function() {
-                    return await this.sendMessage('Simple task message');
-                }
-            ]);
+            // Child Saico without context (no createQ)
+            const child = new Saico({ name: 'simple' });
+            child.activate();
+            session.spawn(child);
 
-            await simpleTask;
+            // sendMessage on child without own context should find parent's context
+            await child.sendMessage('Simple task message');
 
             expect(openai.send.calledOnce).to.be.true;
         });
@@ -217,11 +215,12 @@ describe('Integration Tests', function () {
             session.TOOL_child_tool = sandbox.stub().resolves({ content: 'tool result', functions: null });
             session.activate({ createQ: true });
 
-            const child = session.spawnTaskWithContext({
+            const child = new Saico({
                 name: 'child',
                 prompt: 'Child prompt',
-                // No TOOL_ method on child — should find on parent Saico
-            }, []);
+            });
+            child.activate({ createQ: true });
+            session.spawn(child);
 
             const toolCallReply = {
                 content: 'Calling tool',
@@ -244,45 +243,20 @@ describe('Integration Tests', function () {
         });
     });
 
-    describe('Legacy createQ Compatibility', () => {
-        it('should work with createQ factory function', async () => {
-            const ctx = createQ('Test prompt', null, 'test-tag', 1000, null);
-
-            expect(ctx.prompt).to.equal('Test prompt');
-            expect(ctx.tag).to.equal('test-tag');
-
-            const reply = await ctx.sendMessage('user', 'Hello');
-            expect(reply.content).to.equal('AI response');
-        });
-
-        it('should maintain backward compatible API', () => {
-            const ctx = createQ('Test', null, 'tag');
-
-            // Test array-like access
-            ctx.push({ role: 'user', content: 'Hi' });
-            expect(ctx[0]).to.deep.equal({ role: 'user', content: 'Hi' });
-            expect(ctx.length).to.equal(1);
-
-            // Test methods
-            expect(typeof ctx.sendMessage).to.equal('function');
-            expect(typeof ctx.close).to.equal('function');
-            expect(typeof ctx.serialize).to.equal('function');
-        });
-    });
-
     describe('Context Close and Summary Bubbling', () => {
         it('should bubble summary to parent when closing', async () => {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-
             });
             session.activate({ createQ: true });
 
-            const child = session.spawnTaskWithContext({
+            const child = new Saico({
                 name: 'child',
                 prompt: 'Child prompt',
-            }, []);
+            });
+            child.activate({ createQ: true });
+            session.spawn(child);
 
             // Add some conversation to child
             child.context._msgs.push({
@@ -329,35 +303,11 @@ describe('Integration Tests', function () {
         });
     });
 
-    describe('createTask Factory', () => {
-        it('should create task with context when prompt provided', () => {
-            const task = createTask({
-                name: 'test-task',
-                prompt: 'Task prompt',
-                functions: [{ name: 'func1' }]
-            }, []);
-
-            expect(task).to.be.instanceOf(Itask);
-            expect(task.context).to.exist;
-            expect(task.context.prompt).to.equal('Task prompt');
-        });
-
-        it('should create task without context when no prompt', () => {
-            const task = createTask({
-                name: 'simple-task'
-            }, []);
-
-            expect(task).to.be.instanceOf(Itask);
-            expect(task.context).to.be.null;
-        });
-    });
-
     describe('Concurrent Operations', () => {
         it('should handle multiple concurrent sendMessage calls', async () => {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-
             });
             session.activate({ createQ: true });
 
@@ -375,22 +325,19 @@ describe('Integration Tests', function () {
             expect(results.filter(r => r.content === 'Response' || r.queued).length).to.equal(3);
         });
 
-        it('should handle multiple child tasks', async () => {
+        it('should handle multiple child Saico instances', async () => {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-
             });
             session.activate({ createQ: true });
 
             const children = [];
             for (let i = 0; i < 3; i++) {
-                children.push(session.spawnTask({
-                    name: `child-${i}`,
-                    async: true
-                }, [
-                    function() { return this.name; }
-                ]));
+                const child = new Saico({ name: `child-${i}` });
+                child.activate({ states: [function() { return this.name; }] });
+                session.spawn(child);
+                children.push(child._task);
             }
 
             // Start all children
@@ -398,8 +345,6 @@ describe('Integration Tests', function () {
 
             const results = await Promise.all(children);
 
-            // bind context is the Saico instance, not the task — so this.name = session name
-            // The retval comes from the state function
             expect(results).to.have.length(3);
         });
     });
@@ -409,7 +354,6 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-
             });
             session.activate({ createQ: true });
 
@@ -427,7 +371,6 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-
             });
             session.activate({ createQ: true });
 
@@ -469,7 +412,7 @@ describe('Integration Tests', function () {
     });
 
     describe('Context ID and Message Tagging', () => {
-        it('should generate context_id for tasks with contexts', () => {
+        it('should generate context_id for Saico with context', () => {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
@@ -481,17 +424,19 @@ describe('Integration Tests', function () {
             expect(session.context.tag).to.equal(session.context_id);
         });
 
-        it('should generate context_id for child tasks', () => {
+        it('should generate distinct context_id for child', () => {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
             });
             session.activate({ createQ: true });
 
-            const child = session.spawnTaskWithContext({
+            const child = new Saico({
                 name: 'child',
                 prompt: 'Child prompt',
-            }, []);
+            });
+            child.activate({ createQ: true });
+            session.spawn(child);
 
             expect(child.context_id).to.be.a('string');
             expect(child.context_id).to.not.equal(session.context_id);
@@ -501,7 +446,6 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-
             });
             session.activate({ createQ: true });
 
@@ -517,7 +461,6 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-
             });
             session.activate({ createQ: true });
 
@@ -672,7 +615,6 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-
             });
             session.activate({ createQ: true });
 
@@ -696,7 +638,6 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
-
             });
             session.activate({ createQ: true });
             session.context.QUEUE_LIMIT = 10;
@@ -726,7 +667,6 @@ describe('Integration Tests', function () {
             const session = new Saico({
                 name: 'persist-session',
                 prompt: 'Session prompt',
-
             });
             session.activate({ createQ: true });
 

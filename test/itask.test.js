@@ -5,7 +5,6 @@ const sinon = require('sinon');
 const expect = chai.expect;
 
 const Itask = require('../itask.js');
-const { Store } = require('../store.js');
 
 describe('Itask', function () {
     let sandbox;
@@ -16,13 +15,11 @@ describe('Itask', function () {
             sandbox.stub(console, 'log');
         // Clear root registry before each test
         Itask.root.clear();
-        Store.instance = null;
     });
 
     afterEach(() => {
         sandbox.restore();
         Itask.root.clear();
-        Store.instance = null;
     });
 
     describe('constructor', () => {
@@ -39,7 +36,7 @@ describe('Itask', function () {
             expect(task.id).to.equal('my-custom-id');
         });
 
-        it('should register task in root if no parent', () => {
+        it('should register task in root', () => {
             const task = new Itask({ name: 'root-task', async: true }, []);
             expect(Itask.root.has(task)).to.be.true;
         });
@@ -55,30 +52,11 @@ describe('Itask', function () {
             expect(task.funcs).to.have.length(1);
         });
 
-        it('should initialize context-related properties', () => {
-            const task = new Itask({
-                name: 'ctx-task',
-                prompt: 'Test prompt',
-                async: true
-            }, []);
-            expect(task.prompt).to.equal('Test prompt');
-            expect(task.context).to.be.null;
-        });
-
-        it('should initialize context_id as null by default', () => {
+        it('should not have context-related properties', () => {
             const task = new Itask({ name: 'test', async: true }, []);
-            expect(task.context_id).to.be.null;
-        });
-
-        it('should accept explicit context_id', () => {
-            const task = new Itask({ name: 'test', context_id: 'custom-id', async: true }, []);
-            expect(task.context_id).to.equal('custom-id');
-        });
-
-        it('should accept store option', () => {
-            const mockStore = { generateId: () => 'mock-id', save: () => {}, load: () => {} };
-            const task = new Itask({ name: 'test', store: mockStore, async: true }, []);
-            expect(task._store).to.equal(mockStore);
+            expect(task.context).to.be.undefined;
+            expect(task.context_id).to.be.undefined;
+            expect(task.prompt).to.be.undefined;
         });
     });
 
@@ -206,7 +184,6 @@ describe('Itask', function () {
             // Parent: async, never starts running — _ecancel takes the !running path
             const parent = new Itask({ name: 'parent', async: true }, []);
             // Child: auto-runs using setImmediate loop (no Timeout resources)
-            // so timer count changes are only from the leaked/cleared child-wait timeout
             const child = new Itask({ name: 'child' }, [
                 async function() {
                     const end = Date.now() + 200;
@@ -222,22 +199,16 @@ describe('Itask', function () {
 
             const timersBefore = process.getActiveResourcesInfo().filter(r => r === 'Timeout').length;
 
-            // child is running (setImmediate loop), parent never ran
             parent._ecancel();
-            // Wait for child to finish (200ms) + buffer, but NOT for the 2s timer
             await new Promise(resolve => setTimeout(resolve, 400));
 
-            // No extra timers should remain — the 2s child-wait timer must be cleared
             const timersAfter = process.getActiveResourcesInfo().filter(r => r === 'Timeout').length;
             expect(timersAfter).to.be.at.most(timersBefore);
         });
 
         it('should clear child-wait timeout in _run when children complete first', async () => {
-            // Use async:true to prevent auto-start, so we can yield first
             const parent = new Itask({ name: 'parent', async: true }, [
                 async function main() {
-                    // Child uses setImmediate loop (no Timeout resources)
-                    // so timer count changes are only from the leaked/cleared child-wait timeout
                     const child = new Itask({ name: 'child', async: true }, [
                         async function() {
                             const end = Date.now() + 50;
@@ -252,7 +223,6 @@ describe('Itask', function () {
             ]);
             parent.child_completion_timeout = 2000;
 
-            // Yield to let mocha set its test timeout, then measure baseline
             await new Promise(r => setImmediate(r));
             const timersBefore = process.getActiveResourcesInfo().filter(r => r === 'Timeout').length;
 
@@ -260,7 +230,6 @@ describe('Itask', function () {
             await parent;
             await new Promise(resolve => setTimeout(resolve, 100));
 
-            // No extra timers should remain — the 2s child-wait timer must be cleared
             const timersAfter = process.getActiveResourcesInfo().filter(r => r === 'Timeout').length;
             expect(timersAfter).to.be.at.most(timersBefore);
         });
@@ -280,77 +249,6 @@ describe('Itask', function () {
             await new Promise(resolve => setTimeout(resolve, 100));
 
             expect(child.error).to.be.instanceOf(Error);
-        });
-    });
-
-    describe('context management', () => {
-        it('should return null for getContext when no context', () => {
-            const task = new Itask({ name: 'test', async: true }, []);
-            expect(task.getContext()).to.be.null;
-        });
-
-        it('should set and get context', () => {
-            const task = new Itask({ name: 'test', async: true }, []);
-            const mockContext = { prompt: 'test' };
-
-            task.setContext(mockContext);
-
-            expect(task.context).to.equal(mockContext);
-        });
-
-        it('should generate context_id when setting context', () => {
-            const task = new Itask({ name: 'test', async: true }, []);
-            const mockContext = { prompt: 'test' };
-
-            task.setContext(mockContext);
-
-            expect(task.context_id).to.be.a('string');
-            expect(task.context_id.length).to.be.greaterThan(0);
-        });
-
-        it('should set context tag to context_id', () => {
-            const task = new Itask({ name: 'test', async: true }, []);
-            const mockContext = { prompt: 'test', tag: null };
-
-            task.setContext(mockContext);
-
-            expect(mockContext.tag).to.equal(task.context_id);
-        });
-
-        it('should get ancestor contexts', () => {
-            const parent = new Itask({ name: 'parent', async: true }, []);
-            const child = new Itask({ name: 'child', async: true }, []);
-            parent.spawn(child);
-
-            parent.context = { prompt: 'parent' };
-            child.context = { prompt: 'child' };
-
-            const ancestors = child.getAncestorContexts();
-            expect(ancestors).to.have.length(2);
-            expect(ancestors[0].prompt).to.equal('parent');
-            expect(ancestors[1].prompt).to.equal('child');
-        });
-
-        it('should find nearest context in hierarchy', () => {
-            const parent = new Itask({ name: 'parent', async: true }, []);
-            const child = new Itask({ name: 'child', async: true }, []);
-            parent.spawn(child);
-
-            parent.context = { prompt: 'parent' };
-
-            expect(child.findContext()).to.equal(parent.context);
-        });
-
-        it('should aggregate functions from hierarchy', () => {
-            const parent = new Itask({ name: 'parent', async: true, functions: [{ name: 'a' }] }, []);
-            const child = new Itask({ name: 'child', async: true, functions: [{ name: 'b' }] }, []);
-            parent.spawn(child);
-
-            parent.context = { functions: [{ name: 'a' }] };
-            child.context = { functions: [{ name: 'b' }] };
-
-            const funcs = child.getHierarchyFunctions();
-            expect(funcs).to.have.length(2);
         });
     });
 

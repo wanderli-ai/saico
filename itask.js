@@ -14,13 +14,11 @@
 
 'use strict';
 
-const assert = require('assert');
 const EventEmitter = require('events');
 const crypto = require('crypto');
 const util = require('./util.js');
-const { Store } = require('./store.js');
 
-const { _log, lerr , _ldbg, daysSince, minSince, shallowEqual, filterArray, logEvent } = util;
+const { _log, lerr , _ldbg } = util;
 
 /* ---------- utility ---------- */
 function makeId(len = 12){
@@ -99,26 +97,9 @@ function Itask(opt, states){
     this._cancel_state_idx = this.states.findIndex(s => s.cancel);
     this._root_registered = false;
 
-    // Context support - optional conversation context attached to this task
-    this.context = null;
-    this._contextConfig = opt.contextConfig || {};
-
-    // Storage persistence
-    this.context_id = opt.context_id || null;
-    this._store = opt.store || Store.instance || null;
-
-    // Store options for context creation (prompt, functions, etc.)
-    this.prompt = opt.prompt;
-    this.functions = opt.functions;
-
-    // register root if no explicit spawn_parent provided
-    // If opt.spawn_parent provided, spawn under it
-    if (opt.spawn_parent && opt.spawn_parent instanceof Itask){
-        opt.spawn_parent.spawn(this);
-    } else {
-        Itask.root.add(this);
-        this._root_registered = true;
-    }
+    // All tasks register as root; parent set via itask.spawn()
+    Itask.root.add(this);
+    this._root_registered = true;
 
     // async option defers immediate run
     if (!opt.async){
@@ -376,15 +357,6 @@ Itask.prototype.spawn = function spawn(child){
             Itask.root.delete(child);
             child._root_registered = false;
         }
-        // Auto-wrap with redis observable for live state persistence
-        if (child.context_id) {
-            try {
-                const redis = require('./redis.js');
-                if (redis.rclient) {
-                    redis.createObservableForRedis('saico:' + child.context_id, child);
-                }
-            } catch (e) { /* redis not available */ }
-        }
         // ensure async-created children begin execution
         if (!child.running && !child._completed){
             process.nextTick(() => {
@@ -593,181 +565,6 @@ Itask.ps = function ps(){
     }
     return out || '<no roots>';
 };
-
-/* ---------- context management ---------- */
-// [BACKEND] explanation text appended to context prompts
-Itask.BACKEND_EXPLANATION = '\nNote: Messages prefixed with [BACKEND] are from the backend ' +
-    'server, not the user. They contain server instructions, data updates, or system context. ' +
-    'Treat them as authoritative system-level information.';
-
-// Get the context for this task, optionally creating one if needed
-Itask.prototype.getContext = function getContext(createIfMissing = false){
-    if (this.context)
-        return this.context;
-    if (createIfMissing && this.prompt){
-        // Lazy context creation - requires Context class to be set
-        if (Itask.Context){
-            const augmentedPrompt = this.prompt + Itask.BACKEND_EXPLANATION;
-            this.context = new Itask.Context(augmentedPrompt, this, this._contextConfig);
-            this.setContext(this.context);
-            return this.context;
-        }
-    }
-    return null;
-};
-
-// Set context for this task
-Itask.prototype.setContext = function setContext(context){
-    this.context = context;
-    // Generate context_id if not already set
-    if (!this.context_id) {
-        if (this._store)
-            this.context_id = this._store.generateId();
-        else if (Store.instance)
-            this.context_id = Store.instance.generateId();
-        else
-            this.context_id = makeId(16);
-    }
-    if (context) {
-        context.tag = this.context_id;
-        if (typeof context.setTask === 'function')
-            context.setTask(this);
-    }
-    return this;
-};
-
-// Get all ancestor contexts (walking up the task hierarchy)
-Itask.prototype.getAncestorContexts = function getAncestorContexts(){
-    const contexts = [];
-    let task = this;
-    while (task){
-        if (task.context)
-            contexts.unshift(task.context); // Add to front so ancestors come first
-        task = task.parent;
-    }
-    return contexts;
-};
-
-// Find the nearest context in the hierarchy (this task or ancestors)
-Itask.prototype.findContext = function findContext(){
-    let task = this;
-    while (task){
-        if (task.context)
-            return task.context;
-        task = task.parent;
-    }
-    return null;
-};
-
-// Send a backend message using the context hierarchy
-// New signature: sendMessage(content, functions, opts)
-// Always sends as role='user' with '[BACKEND] ' prefix
-Itask.prototype.sendMessage = async function sendMessage(content, functions, opts){
-    // First try our own context
-    let ctx = this.getContext();
-    if (!ctx){
-        // Walk up to find a context
-        ctx = this.findContext();
-    }
-    if (!ctx){
-        throw new Error('No context available in task hierarchy to send message');
-    }
-    opts = Object.assign({}, opts, { tag: this.context_id });
-    return ctx.sendMessage('user', '[BACKEND] ' + content, functions, opts);
-};
-
-// Receive a user chat message (no [BACKEND] prefix)
-Itask.prototype.recvChatMessage = async function recvChatMessage(content, opts){
-    let ctx = this.getContext();
-    if (!ctx){
-        ctx = this.findContext();
-    }
-    if (!ctx){
-        throw new Error('No context available in task hierarchy to receive message');
-    }
-    opts = Object.assign({}, opts, { tag: this.context_id });
-    return ctx.sendMessage('user', content, null, opts);
-};
-
-// Aggregate functions from all contexts in the hierarchy
-Itask.prototype.getHierarchyFunctions = function getHierarchyFunctions(){
-    const allFunctions = [];
-    const contexts = this.getAncestorContexts();
-    for (const ctx of contexts){
-        if (ctx.functions && Array.isArray(ctx.functions))
-            allFunctions.push(...ctx.functions);
-    }
-    // Add this task's own functions if not already in a context
-    if (this.functions && !this.context)
-        allFunctions.push(...this.functions);
-    return allFunctions;
-};
-
-// Close this task's context (if any) and bubble summary to parent
-Itask.prototype.closeContext = async function closeContext(){
-    if (!this.context)
-        return;
-
-    // Clean tool call messages tagged with this context_id
-    if (this.context_id && typeof this.context.cleanToolCallsByTag === 'function')
-        this.context.cleanToolCallsByTag(this.context_id);
-
-    // Filter out tool calls and [BACKEND] messages, compress remaining as chat_history
-    const cleanedMsgs = this.context._msgs.filter(m => {
-        if (m.msg.tool_calls)
-            return false;
-        if (m.msg.role === 'tool')
-            return false;
-        if (typeof m.msg.content === 'string' && m.msg.content.startsWith('[BACKEND]'))
-            return false;
-        return true;
-    }).map(m => m.msg);
-
-    // Trim to last QUEUE_LIMIT before persisting
-    const queueLimit = this.context.QUEUE_LIMIT || 30;
-    const trimmedMsgs = cleanedMsgs.length > queueLimit
-        ? cleanedMsgs.slice(-queueLimit)
-        : cleanedMsgs;
-
-    if (trimmedMsgs.length > 0) {
-        const chat_history = await util.compressMessages(trimmedMsgs);
-        this.context.chat_history = chat_history;
-
-        // Persist to store
-        const store = this._store || Store.instance;
-        if (store && this.context_id) {
-            await store.save(this.context_id, {
-                chat_history,
-                tool_digest: this.context.tool_digest || [],
-                prompt: this.context.prompt,
-                tag: this.context.tag,
-                tm_closed: Date.now()
-            });
-        }
-    }
-
-    await this.context.close();
-};
-
-// Walk DOWN to find the deepest active descendant with a context
-Itask.prototype.findDeepestContext = function findDeepestContext() {
-    let deepest = this.context ? { context: this.context, depth: 0 } : null;
-    const search = (task, depth) => {
-        for (const child of task.child) {
-            if (child._completed) continue;
-            if (child.context) {
-                if (!deepest || depth + 1 >= deepest.depth)
-                    deepest = { context: child.context, depth: depth + 1 };
-            }
-            search(child, depth + 1);
-        }
-    };
-    search(this, 0);
-    return deepest ? deepest.context : null;
-};
-
-// Reference to Context class (set by index.js to avoid circular dependency)
-Itask.Context = null;
 
 /* ---------- export ---------- */
 module.exports = Itask;
