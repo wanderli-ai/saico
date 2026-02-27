@@ -8,23 +8,17 @@ const { _log, _lerr, _ldbg } = util;
 const debug = 0;
 
 /**
- * Context - Conversation context that can be attached to any Itask.
- *
- * Key differences from the old Messages class:
- * - Uses task hierarchy instead of parent/child messages
- * - task reference replaces parent reference
- * - getMsgContext() traverses task hierarchy
- * - _createMsgQ() aggregates from task ancestors
+ * Msgs - Pure message queue with tool call handling, summarization, and LLM communication.
+ * Saico sets callback hooks after construction to wire in hierarchy access.
  */
-class Context {
-    constructor(prompt, task, config = {}) {
+class Msgs {
+    constructor(prompt, config = {}) {
         this.prompt = prompt;
-        this.task = task; // Reference to owning Itask (replaces parent)
         this.tag = config.tag || crypto.randomBytes(4).toString('hex');
         this.token_limit = config.token_limit || 1000000000;
         this.lower_limit = this.token_limit * 0.85;
         this.upper_limit = this.token_limit * 0.98;
-        this.functions = config.functions || task?.functions || null;
+        this.functions = config.functions || null;
 
         // Recursive depth and repetition control
         this.max_depth = config.max_depth || 5;
@@ -50,18 +44,15 @@ class Context {
         // Tool digest — persistent history of tool calls that mutated task state
         this.tool_digest = config.tool_digest || [];
 
+        // Callback hooks — set by Saico after construction
+        this._findToolImpl = null;   // (toolName) => { saico, methodName } | null
+        this._getSnapshot = null;    // () => serializable snapshot for dirty detection
+
         // Initialize messages: explicit msgs take priority over chat_history
         this._chat_history = config.chat_history || null;
         (config.msgs || []).forEach(m => this.push(m));
 
-        _log('created Context for tag', this.tag);
-    }
-
-    // Set the task reference (used when context is created separately)
-    setTask(task) {
-        this.task = task;
-        if (!this.functions)
-            this.functions = task?.functions;
+        _log('created Msgs for tag', this.tag);
     }
 
     /**
@@ -133,32 +124,6 @@ class Context {
         this.tool_digest.push({ tool: toolName, result: truncated, tm: Date.now() });
         if (this.tool_digest.length > this.TOOL_DIGEST_LIMIT)
             this.tool_digest = this.tool_digest.slice(-this.TOOL_DIGEST_LIMIT);
-    }
-
-    // Get the parent context by traversing task hierarchy (via Saico)
-    getParentContext() {
-        if (!this.task || !this.task.parent)
-            return null;
-        let task = this.task.parent;
-        while (task) {
-            if (task._saico?.context) return task._saico.context;
-            task = task.parent;
-        }
-        return null;
-    }
-
-    // Get all ancestor contexts via task hierarchy (via Saico)
-    getAncestorContexts() {
-        if (!this.task)
-            return [];
-        const contexts = [];
-        let task = this.task.parent;
-        while (task) {
-            if (task._saico?.context)
-                contexts.unshift(task._saico.context);
-            task = task.parent;
-        }
-        return contexts;
     }
 
     _hasPendingToolCalls() {
@@ -334,16 +299,15 @@ class Context {
                     };
                 } else {
                     this._trackActiveToolCall(call);
-                    const _snap = this.task
-                        ? JSON.stringify(this._snapshotPublicProps(this.task)) : null;
+                    const _snap = this._getSnapshot
+                        ? JSON.stringify(this._getSnapshot()) : null;
 
                     try {
                         const correspondingDeferred = deferredGroup.find(d => d.call.id === call.id);
                         const timeout = correspondingDeferred?.originalMessage.opts.timeout;
 
                         result = await this._executeToolCallWithTimeout(call, timeout);
-                        if (_snap !== null &&
-                            _snap !== JSON.stringify(this._snapshotPublicProps(this.task)))
+                        if (_snap !== null && _snap !== JSON.stringify(this._getSnapshot()))
                             this._appendToolDigest(call.function.name, result?.content || '');
                     } finally {
                         this._completeActiveToolCall(call);
@@ -433,24 +397,6 @@ class Context {
 
     getSummaries() { return this._msgs.filter(m => m.opts.summary); }
 
-    // Get functions aggregated from this context and all ancestor contexts
-    getFunctions() {
-        const allFunctions = [];
-
-        // Get functions from ancestor contexts via task hierarchy
-        const ancestorContexts = this.getAncestorContexts();
-        for (const ctx of ancestorContexts) {
-            if (ctx.functions && Array.isArray(ctx.functions))
-                allFunctions.push(...ctx.functions);
-        }
-
-        // Add our own functions
-        if (this.functions && Array.isArray(this.functions))
-            allFunctions.push(...this.functions);
-
-        return allFunctions.length > 0 ? allFunctions : null;
-    }
-
     async summarizeMessages() {
         const tokens = util.countTokens(this.__msgs);
         if (tokens < this.lower_limit)
@@ -459,7 +405,7 @@ class Context {
     }
 
     async close() {
-        _log('Closing Context tag', this.tag);
+        _log('Closing Msgs tag', this.tag);
 
         if (this._sequential_mode && this._processing_sequential) {
             _ldbg('Sequential mode: waiting for current message to complete before closing tag', this.tag);
@@ -472,22 +418,8 @@ class Context {
             }
         }
 
-        // Move waiting messages to parent context via task hierarchy
-        const parentCtx = this.getParentContext();
-        if (parentCtx && this._waitingQueue.length > 0) {
-            _log('Moving', this._waitingQueue.length, 'waiting messages to parent context');
-            parentCtx._waitingQueue.push(...this._waitingQueue);
-            this._waitingQueue = [];
-        }
-
-        if (parentCtx && this._sequential_queue.length > 0) {
-            _log('Moving', this._sequential_queue.length, 'sequential queue messages to parent context');
-            parentCtx._sequential_queue.push(...this._sequential_queue);
-            this._sequential_queue = [];
-        }
-
-        await this._summarizeContext(true, parentCtx);
-        _log('Finished closing Context tag', this.tag);
+        await this._summarizeContext(true);
+        _log('Finished closing Msgs tag', this.tag);
     }
 
 
@@ -589,38 +521,6 @@ class Context {
             summary = 'Summary of ' + this.tag + ' conversation:\n' + reply.content;
         }
         return summary;
-    }
-
-    // Get message context - walks up task hierarchy to collect prompts and summaries
-    getMsgContext(add_tag) {
-        const msgs = [];
-
-        // Get context from ancestor tasks via task hierarchy
-        const ancestorContexts = this.getAncestorContexts();
-        for (const ctx of ancestorContexts) {
-            if (ctx.prompt)
-                msgs.push({role: 'system', content: ctx.prompt});
-            // Add summaries from ancestor contexts
-            const summaries = ctx._msgs.filter(m => m.opts.summary || m.msg.role === 'system').map(m => {
-                if (add_tag)
-                    m.msg.tag = ctx.tag;
-                return m.msg;
-            });
-            msgs.push(...summaries);
-        }
-
-        // Add this context's prompt
-        if (this.prompt)
-            msgs.push({role: 'system', content: this.prompt});
-
-        // Add this context's summaries
-        const mySummaries = this._msgs.filter(m => m.opts.summary || m.msg.role === 'system').map(m => {
-            if (add_tag)
-                m.msg.tag = this.tag;
-            return m.msg;
-        });
-
-        return msgs.concat(mySummaries);
     }
 
     _createMsgObj(role, content, functions, opts) {
@@ -952,10 +852,10 @@ class Context {
                     ? [...o.opts._aggregatedFunctions, ...messageFuncs]
                     : null;
             } else {
-                const hierarchyFuncs = this.getFunctions() || [];
+                const ownFuncs = this.functions || [];
                 const messageFuncs = o.functions || [];
-                funcs = [...hierarchyFuncs, ...messageFuncs].length > 0
-                    ? [...hierarchyFuncs, ...messageFuncs]
+                funcs = [...ownFuncs, ...messageFuncs].length > 0
+                    ? [...ownFuncs, ...messageFuncs]
                     : null;
             }
 
@@ -1024,15 +924,15 @@ class Context {
 
                 for (const { call, isDuplicate } of toolCallsWithResults) {
                     if (!isDuplicate) {
-                        const _snap = this.task
-                            ? JSON.stringify(this._snapshotPublicProps(this.task)) : null;
+                        const _snap = this._getSnapshot
+                            ? JSON.stringify(this._getSnapshot()) : null;
                         try {
                             const result = await this._executeToolCallWithTimeout(
                                 call, o.opts?.timeout);
                             const item = toolCallsWithResults.find(item => item.call.id === call.id);
                             if (item) item.result = result;
                             if (_snap !== null &&
-                                _snap !== JSON.stringify(this._snapshotPublicProps(this.task)))
+                                _snap !== JSON.stringify(this._getSnapshot()))
                                 this._appendToolDigest(call.function.name, result?.content || '');
                         } finally {
                             this._completeActiveToolCall(call);
@@ -1088,39 +988,11 @@ class Context {
     }
 
     /**
-     * Search the Saico hierarchy for a TOOL_<toolName> method.
-     * Order: current task → walk UP parents → walk DOWN children (BFS).
+     * Find a TOOL_<toolName> implementation. Delegates to _findToolImpl callback
+     * set by Saico, which searches the hierarchy.
      */
     _findToolImplementation(toolName) {
-        const methodName = 'TOOL_' + toolName;
-        const check = (task) =>
-            task?._saico && typeof task._saico[methodName] === 'function' ? task._saico : null;
-
-        // 1. Current task
-        let found = check(this.task);
-        if (found) return { saico: found, methodName };
-
-        // 2. Walk UP parent chain
-        let t = this.task?.parent;
-        while (t) {
-            found = check(t);
-            if (found) return { saico: found, methodName };
-            t = t.parent;
-        }
-
-        // 3. Walk DOWN from this.task (BFS)
-        if (this.task) {
-            const queue = [...this.task.child];
-            while (queue.length > 0) {
-                const child = queue.shift();
-                if (child._completed) continue;
-                found = check(child);
-                if (found) return { saico: found, methodName };
-                if (child.child?.size > 0) queue.push(...child.child);
-            }
-        }
-
-        return null;
+        return this._findToolImpl ? this._findToolImpl(toolName) : null;
     }
 
     async interpretAndApplyChanges(call) {
@@ -1169,35 +1041,11 @@ class Context {
         return { content, functions };
     }
 
-    // Spawn child context (creates a child task with its own context)
-    spawnChild(prompt, tag, config = {}) {
-        if (!this.task) {
-            // If no task, create a standalone context
-            return createContext(prompt, null, { ...config, tag });
-        }
-
-        // Create a child task with its own context
-        const Itask = require('./itask.js');
-        const childTask = new Itask({
-            name: tag || 'child-context',
-            async: true,
-        }, []);
-        this.task.spawn(childTask);
-
-        const childContext = new Context(prompt, childTask, { ...config, tag });
-        // Store context on Saico if present, otherwise just set on task reference
-        if (childTask._saico) {
-            childTask._saico.context = childContext;
-            childTask._saico.context_id = childContext.tag;
-        }
-
-        return childContext;
-    }
 }
 
-// Factory function to create a Context with Proxy wrapper
-function createContext(prompt, task, config = {}) {
-    const instance = new Context(prompt, task, config);
+// Factory function to create a Msgs instance with Proxy wrapper
+function createMsgs(prompt, config = {}) {
+    const instance = new Msgs(prompt, config);
 
     return new Proxy(instance, {
         get(target, prop, receiver) {
@@ -1246,4 +1094,4 @@ function createContext(prompt, task, config = {}) {
     });
 }
 
-module.exports = { Context, createContext };
+module.exports = { Msgs, createMsgs };

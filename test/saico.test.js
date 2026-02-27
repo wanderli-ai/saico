@@ -5,7 +5,7 @@ const sinon = require('sinon');
 const expect = chai.expect;
 
 const { Saico } = require('../saico.js');
-const { Context } = require('../msgs.js');
+const { Msgs } = require('../msgs.js');
 const Itask = require('../itask.js');
 const { Store } = require('../store.js');
 const openai = require('../openai.js');
@@ -41,7 +41,7 @@ describe('Saico', function () {
     describe('constructor', () => {
         it('should create instance with default values', () => {
             const s = new Saico();
-            expect(s._id).to.be.a('string').with.lengthOf(16);
+            expect(s.id).to.be.a('string').with.lengthOf(16);
             expect(s._task).to.be.null;
             expect(s.name).to.equal('Saico');
             expect(s.prompt).to.equal('');
@@ -65,7 +65,7 @@ describe('Saico', function () {
                 userData: { key: 'val' },
                 isolate: true,
             });
-            expect(s._id).to.equal('my-id');
+            expect(s.id).to.equal('my-id');
             expect(s.name).to.equal('my-service');
             expect(s.prompt).to.equal(fakePrompt);
             expect(s.functions).to.equal(funcs);
@@ -86,7 +86,7 @@ describe('Saico', function () {
             redis.rclient = fakeRclient;
 
             const s = new Saico({ id: 'test-id', redis: true });
-            expect(s._id).to.equal('test-id');
+            expect(s.id).to.equal('test-id');
             expect(s.name).to.equal('Saico');
             expect(typeof s.lastMod).to.equal('function');
         });
@@ -154,7 +154,7 @@ describe('Saico', function () {
         it('should create context only when createQ is true', () => {
             const s = new Saico({ prompt: fakePrompt });
             s.activate({ createQ: true });
-            expect(s.context).to.be.instanceOf(Context);
+            expect(s.context).to.be.instanceOf(Msgs);
         });
 
         it('should combine class-level and activation-level prompts', () => {
@@ -167,7 +167,7 @@ describe('Saico', function () {
         it('should create context without prompts when createQ is true', () => {
             const s = new Saico();
             s.activate({ createQ: true });
-            expect(s.context).to.be.instanceOf(Context);
+            expect(s.context).to.be.instanceOf(Msgs);
             expect(s.context.prompt).to.equal('');
         });
 
@@ -222,7 +222,7 @@ describe('Saico', function () {
         it('should use this.createQ from constructor opts', () => {
             const s = new Saico({ prompt: 'test', createQ: true });
             s.activate();
-            expect(s.context).to.be.instanceOf(Context);
+            expect(s.context).to.be.instanceOf(Msgs);
         });
 
         it('should prefer opts.createQ over this.createQ', () => {
@@ -240,7 +240,7 @@ describe('Saico', function () {
             }
             const agent = new MyAgent();
             agent.activate();
-            expect(agent.context).to.be.instanceOf(Context);
+            expect(agent.context).to.be.instanceOf(Msgs);
         });
 
         it('should pass context config options', () => {
@@ -270,19 +270,9 @@ describe('Saico', function () {
         it('should store context directly on Saico', () => {
             const s = new Saico({ prompt: fakePrompt });
             s.activate({ createQ: true });
-            expect(s.context).to.be.instanceOf(Context);
+            expect(s.context).to.be.instanceOf(Msgs);
             expect(s.context_id).to.be.a('string');
             expect(s.context_id.length).to.be.greaterThan(0);
-        });
-
-        it('setContext should set context and generate context_id', () => {
-            const s = new Saico();
-            s.activate();
-            const ctx = new Context('test', s._task, {});
-            s.setContext(ctx);
-            expect(s.context).to.equal(ctx);
-            expect(s.context_id).to.be.a('string');
-            expect(ctx.tag).to.equal(s.context_id);
         });
 
         it('findContext should walk up Saico hierarchy', () => {
@@ -802,7 +792,7 @@ describe('Saico', function () {
         });
 
         it('should save full state to Store with compressed msgs', async () => {
-            const mockStore = { save: sandbox.stub().resolves(), load: sandbox.stub(), generateId: () => require('crypto').randomBytes(8).toString('hex') };
+            const mockStore = { save: sandbox.stub().resolves(), load: sandbox.stub() };
             const s = new Saico({ id: 'test-id', name: 'test', prompt: 'p' });
             s._store = mockStore;
             s.activate({ createQ: true });
@@ -858,14 +848,13 @@ describe('Saico', function () {
             const mockStore = {
                 save: sandbox.stub().resolves(),
                 load: sandbox.stub().resolves(storeData),
-                generateId: () => require('crypto').randomBytes(8).toString('hex'),
             };
 
             const restored = await Saico.rehydrate('rh-id', { store: mockStore });
 
             expect(restored).to.be.instanceOf(Saico);
-            expect(restored._id).to.equal('rh-id');
-            expect(restored.context).to.be.instanceOf(Context);
+            expect(restored.id).to.equal('rh-id');
+            expect(restored.context).to.be.instanceOf(Msgs);
             expect(restored.context._msgs).to.have.length(2);
             expect(restored.context._msgs[0].msg.content).to.equal('Hello');
             expect(restored.context._msgs[1].msg.content).to.equal('Hi');
@@ -900,7 +889,7 @@ describe('Saico', function () {
             const s = new Saico();
             s.activate({ createQ: true });
             expect(s.task).to.be.instanceOf(Itask);
-            expect(s.context).to.be.instanceOf(Context);
+            expect(s.context).to.be.instanceOf(Msgs);
             expect(s.context_id).to.be.a('string');
             expect(s.isActive).to.be.true;
         });
@@ -1030,12 +1019,12 @@ describe('Saico', function () {
             const serialized = original.serialize();
             const restored = Saico.deserialize(serialized);
 
-            expect(restored._id).to.equal('test-id');
+            expect(restored.id).to.equal('test-id');
             expect(restored.name).to.equal('test');
             expect(restored.prompt).to.equal('p');
             expect(restored.userData).to.deep.equal({ key: 'val' });
             expect(restored.isActive).to.be.true;
-            expect(restored.context).to.be.instanceOf(Context);
+            expect(restored.context).to.be.instanceOf(Msgs);
             expect(restored.context._msgs).to.have.length(1);
         });
 
@@ -1046,7 +1035,7 @@ describe('Saico', function () {
                 prompt: 'p',
             });
             const restored = Saico.deserialize(data);
-            expect(restored._id).to.equal('test-id');
+            expect(restored.id).to.equal('test-id');
             expect(restored.isActive).to.be.false;
         });
 
@@ -1058,7 +1047,7 @@ describe('Saico', function () {
                 tm_create: 1000,
             };
             const restored = Saico.deserialize(data);
-            expect(restored._id).to.equal('test-id');
+            expect(restored.id).to.equal('test-id');
             expect(restored.tm_create).to.equal(1000);
         });
 

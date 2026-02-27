@@ -1,6 +1,6 @@
 {
   "name": "saico",
-  "version": "2.8.0",
+  "version": "2.8.1",
   "main": "index.js",
   "type": "commonjs",
   "description": "Hierarchical AI Conversation Orchestrator - Task hierarchy with conversation contexts",

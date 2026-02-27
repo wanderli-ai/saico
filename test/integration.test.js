@@ -5,7 +5,7 @@ const sinon = require('sinon');
 const expect = chai.expect;
 
 const saico = require('../index.js');
-const { Itask, Context, Saico, Store, createContext } = saico;
+const { Itask, Msgs, Saico, Store, createMsgs } = saico;
 const openai = require('../openai.js');
 const util = require('../util.js');
 
@@ -34,7 +34,7 @@ describe('Integration Tests', function () {
     describe('Module exports', () => {
         it('should export all core classes', () => {
             expect(Itask).to.be.a('function');
-            expect(Context).to.be.a('function');
+            expect(Msgs).to.be.a('function');
             expect(Saico).to.be.a('function');
             expect(Store).to.be.a('function');
         });
@@ -43,8 +43,8 @@ describe('Integration Tests', function () {
             expect(saico.init).to.be.a('function');
         });
 
-        it('should export createContext factory', () => {
-            expect(createContext).to.be.a('function');
+        it('should export createMsgs factory', () => {
+            expect(createMsgs).to.be.a('function');
         });
 
         it('should not export legacy createTask or createQ', () => {
@@ -243,8 +243,8 @@ describe('Integration Tests', function () {
         });
     });
 
-    describe('Context Close and Summary Bubbling', () => {
-        it('should bubble summary to parent when closing', async () => {
+    describe('Deactivate and Message Bubbling', () => {
+        it('should bubble cleaned messages to parent when deactivating', async () => {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
@@ -270,12 +270,14 @@ describe('Integration Tests', function () {
                 replied: 3
             });
 
-            // Close child context
-            await child.context.close();
+            const parentMsgsBefore = session.context._msgs.length;
+            await child.deactivate();
 
-            // Check that summary was added to session context
-            const sessionSummaries = session.context.getSummaries();
-            expect(sessionSummaries.length).to.be.greaterThan(0);
+            // Parent should have gained the user and assistant messages
+            const newMsgs = session.context._msgs.slice(parentMsgsBefore);
+            expect(newMsgs.length).to.equal(2);
+            expect(newMsgs[0].msg.content).to.equal('Hello from child');
+            expect(newMsgs[1].msg.content).to.equal('Hi there!');
         });
     });
 
@@ -297,7 +299,7 @@ describe('Integration Tests', function () {
 
             expect(restored.name).to.equal(original.name);
             expect(restored.prompt).to.equal(original.prompt);
-            expect(restored._id).to.equal(original._id);
+            expect(restored.id).to.equal(original.id);
             expect(restored.userData).to.deep.equal(original.userData);
             expect(restored.context.length).to.equal(original.context.length);
         });
@@ -475,7 +477,7 @@ describe('Integration Tests', function () {
 
     describe('Context cleanToolCallsByTag', () => {
         it('should remove tool-related messages by tag', () => {
-            const ctx = createContext('Test prompt', null, {});
+            const ctx = createMsgs('Test prompt', {});
             const testTag = 'test-tag-123';
 
             ctx._msgs.push({
@@ -525,7 +527,7 @@ describe('Integration Tests', function () {
                 { role: 'assistant', content: 'Previous answer' }
             ]);
 
-            const ctx = createContext('System prompt', null, { tag: 'test-tag', chat_history: compressed });
+            const ctx = createMsgs('System prompt', { tag: 'test-tag', chat_history: compressed });
             await ctx.initHistory();
 
             expect(ctx._msgs).to.have.length(2);
@@ -539,7 +541,7 @@ describe('Integration Tests', function () {
                 { role: 'assistant', content: 'Plain answer' }
             ]);
 
-            const ctx = createContext('System prompt', null, { tag: 'test-tag', chat_history: json });
+            const ctx = createMsgs('System prompt', { tag: 'test-tag', chat_history: json });
             await ctx.initHistory();
 
             expect(ctx._msgs).to.have.length(2);
@@ -658,7 +660,6 @@ describe('Integration Tests', function () {
             const mockStore = {
                 save: sinon.stub().callsFake((id, data) => { saved[id] = data; }),
                 load: sinon.stub().callsFake((id) => saved[id] || null),
-                generateId: () => require('crypto').randomBytes(8).toString('hex'),
             };
 
             const session = new Saico({
@@ -695,7 +696,7 @@ describe('Integration Tests', function () {
 
             // Rehydrate — restore from store
             const restored = await Saico.rehydrate('persist-id', { store: mockStore });
-            expect(restored._id).to.equal('persist-id');
+            expect(restored.id).to.equal('persist-id');
             expect(restored.name).to.equal('persist-session');
             expect(restored.context).to.exist;
 

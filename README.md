@@ -260,7 +260,7 @@ agent.getSessionInfo();
 await agent.closeSession();  // Saves full state to Store, cancels task
 
 // Restore from Store
-const restored = await Saico.rehydrate(agent._id, { store });
+const restored = await Saico.rehydrate(agent.id, { store });
 ```
 
 ## Database Access
@@ -307,7 +307,7 @@ const restored = Saico.deserialize(json);
 
 // Durable persistence (compressed msgs, saved to Store)
 await agent.closeSession();
-const restored2 = await Saico.rehydrate(agent._id, { store });
+const restored2 = await Saico.rehydrate(agent.id, { store });
 ```
 
 `serialize()` includes: id, name, prompt, userData, sessionConfig, tm_create, isolate, and full context state (raw messages, tool_digest). `closeSession()` saves the same shape but with compressed messages for durable storage.
@@ -330,7 +330,7 @@ Properties prefixed with `_` are internal and not persisted.
 
 ## Tool Implementation (TOOL_ methods)
 
-Define tool implementations as `TOOL_`-prefixed methods on your Saico subclass. When the LLM returns a tool call, Context automatically searches the Saico hierarchy (current → up parents → down children) to find and invoke the matching method with parsed arguments.
+Define tool implementations as `TOOL_`-prefixed methods on your Saico subclass. When the LLM returns a tool call, Saico automatically searches the task hierarchy (current → up parents → down children) to find and invoke the matching method with parsed arguments.
 
 ```js
 class MyAgent extends Saico {
@@ -359,13 +359,13 @@ Return a string or `{ content: string, functions?: [] }`.
 
 ## Low-Level API
 
-For cases where you need a standalone context without the Saico master class:
+For cases where you need a standalone message queue without the Saico master class:
 
 ```js
-const { createContext } = require('saico');
+const { createMsgs } = require('saico');
 
-// Standalone context
-const ctx = createContext('System prompt', null, { tag: 'my-tag', token_limit: 4000 });
+// Standalone message queue
+const ctx = createMsgs('System prompt', { tag: 'my-tag', token_limit: 4000 });
 const reply = await ctx.sendMessage('user', 'Hello', functions);
 ```
 
@@ -390,7 +390,7 @@ saico/
 npm test
 ```
 
-296 tests covering Saico lifecycle, context ownership, spawn/spawnAndRun, task hierarchy, message handling, tool calls, DB adapters, serialization, persistence (closeSession/rehydrate), and integration flows.
+290 tests covering Saico lifecycle, context ownership, spawn/spawnAndRun, task hierarchy, message handling, tool calls, DB adapters, serialization, persistence (closeSession/rehydrate), and integration flows.
 
 ## Requirements
 

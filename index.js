@@ -1,7 +1,7 @@
 'use strict';
 
 const Itask = require('./itask.js');
-const { Context, createContext } = require('./msgs.js');
+const { Msgs, createMsgs } = require('./msgs.js');
 const { Store, DynamoBackend } = require('./store.js');
 const { Saico } = require('./saico.js');
 const { DynamoDBAdapter } = require('./dynamo.js');
@@ -34,7 +34,7 @@ module.exports = {
 
     // Core classes
     Itask,
-    Context,
+    Msgs,
     Store,
     DynamoBackend,
 
@@ -42,7 +42,7 @@ module.exports = {
     init,
 
     // Factory
-    createContext,
+    createMsgs,
 
     // Utilities (re-export from util.js)
     util: require('./util.js'),

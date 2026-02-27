@@ -4,7 +4,7 @@ const chai = require('chai');
 const sinon = require('sinon');
 const expect = chai.expect;
 
-const { Context, createContext } = require('../msgs.js');
+const { Msgs, createMsgs } = require('../msgs.js');
 const Itask = require('../itask.js');
 const { Saico } = require('../saico.js');
 const { Store } = require('../store.js');
@@ -12,7 +12,7 @@ const openai = require('../openai.js');
 const util = require('../util.js');
 const redis = require('../redis.js');
 
-describe('Context', function () {
+describe('Msgs', function () {
     let sandbox;
     const fakePrompt = 'You are a helpful assistant.';
     const fakeTokenLimit = 1000;
@@ -40,7 +40,7 @@ describe('Context', function () {
 
     describe('constructor', () => {
         it('should initialize with default values', () => {
-            const ctx = new Context(fakePrompt, null, { token_limit: fakeTokenLimit });
+            const ctx = new Msgs(fakePrompt, { token_limit: fakeTokenLimit });
             expect(ctx.prompt).to.equal(fakePrompt);
             expect(ctx.token_limit).to.equal(fakeTokenLimit);
             expect(ctx.lower_limit).to.equal(fakeTokenLimit * 0.85);
@@ -49,27 +49,27 @@ describe('Context', function () {
         });
 
         it('should generate a tag if not provided', () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             expect(ctx.tag).to.be.a('string');
             expect(ctx.tag.length).to.be.greaterThan(0);
         });
 
-        it('should accept task reference', () => {
-            const task = new Itask({ name: 'test', async: true }, []);
-            const ctx = new Context(fakePrompt, task, {});
-            expect(ctx.task).to.equal(task);
+        it('should have null callback hooks by default', () => {
+            const ctx = new Msgs(fakePrompt, {});
+            expect(ctx._findToolImpl).to.be.null;
+            expect(ctx._getSnapshot).to.be.null;
         });
     });
 
     describe('messages getter/setter', () => {
         it('should set and get messages properly', () => {
-            const ctx = createContext(fakePrompt, null, {});
+            const ctx = createMsgs(fakePrompt, {});
             ctx.messages = [{ role: 'user', content: 'Hi' }];
             expect(ctx.messages).to.deep.equal([{ role: 'user', content: 'Hi' }]);
         });
 
         it('should throw if messages is not an array', () => {
-            const ctx = createContext(fakePrompt, null, {});
+            const ctx = createMsgs(fakePrompt, {});
             expect(() => {
                 ctx.messages = 'invalid';
             }).to.throw('messages must be assigned an array');
@@ -78,7 +78,7 @@ describe('Context', function () {
 
     describe('push', () => {
         it('should push a message', () => {
-            const ctx = createContext(fakePrompt, null, {});
+            const ctx = createMsgs(fakePrompt, {});
             ctx.push({ role: 'user', content: 'Hello' });
             expect(ctx.length).to.equal(1);
             expect(ctx.messages[0]).to.deep.equal({ role: 'user', content: 'Hello' });
@@ -87,7 +87,7 @@ describe('Context', function () {
 
     describe('pushSummary', () => {
         it('should push a summary message', () => {
-            const ctx = createContext(fakePrompt, null, {});
+            const ctx = createMsgs(fakePrompt, {});
             ctx.pushSummary('summary text');
             const last = ctx._msgs[ctx._msgs.length - 1];
             expect(last.msg).to.deep.equal({ role: 'user', content: '[SUMMARY]: summary text' });
@@ -99,7 +99,7 @@ describe('Context', function () {
         let ctx;
 
         beforeEach(() => {
-            ctx = createContext(fakePrompt, null, {});
+            ctx = createMsgs(fakePrompt, {});
             ctx.messages = [
                 { role: 'user', content: 'A' },
                 { role: 'assistant', content: 'B' },
@@ -137,7 +137,7 @@ describe('Context', function () {
 
     describe('serialize', () => {
         it('should serialize the object', () => {
-            const ctx = createContext(fakePrompt, null, {});
+            const ctx = createMsgs(fakePrompt, {});
             ctx.push({ role: 'user', content: 'Hi' });
             const json = ctx.serialize();
             expect(json).to.be.a('string');
@@ -145,67 +145,9 @@ describe('Context', function () {
         });
     });
 
-    describe('getFunctions', () => {
-        it('should return functions from context', () => {
-            const ctx = new Context(fakePrompt, null, {
-                functions: [{ name: 'test_func' }]
-            });
-            const funcs = ctx.getFunctions();
-            expect(funcs).to.have.length(1);
-            expect(funcs[0].name).to.equal('test_func');
-        });
-
-        it('should aggregate functions from ancestor contexts (via Saico)', () => {
-            const parent = new Saico({
-                name: 'parent',
-                functions: [{ name: 'parent_func' }],
-            });
-            parent.activate({ createQ: true });
-
-            const child = new Saico({
-                name: 'child',
-                functions: [{ name: 'child_func' }],
-            });
-            child.activate({ createQ: true });
-            parent.spawn(child);
-
-            const funcs = child.context.getFunctions();
-            expect(funcs).to.have.length(2);
-        });
-    });
-
-    describe('getMsgContext', () => {
-        it('should return prompt and summaries', () => {
-            const ctx = createContext(fakePrompt, null, {});
-            ctx.pushSummary('summary text');
-            const context = ctx.getMsgContext();
-            expect(context[0]).to.deep.equal({ role: 'system', content: fakePrompt });
-            expect(context[1]).to.deep.equal({ role: 'user', content: '[SUMMARY]: summary text' });
-        });
-
-        it('should include ancestor context via Saico hierarchy', () => {
-            const parent = new Saico({ name: 'parent', prompt: 'Parent prompt' });
-            parent.activate({ createQ: true });
-            parent.context.pushSummary('parent summary');
-
-            const child = new Saico({ name: 'child', prompt: fakePrompt });
-            child.activate({ createQ: true });
-            parent.spawn(child);
-            child.context.pushSummary('child summary');
-
-            const context = child.context.getMsgContext();
-
-            // Should include parent prompt and summary, then child prompt and summary
-            expect(context.some(m => m.content === 'Parent prompt')).to.be.false; // parent context prompt not in ancestor chain
-            // The parent context prompt is the augmented one with BACKEND_EXPLANATION
-            expect(context.some(m => m.content?.includes('[SUMMARY]: parent summary'))).to.be.true;
-            expect(context.some(m => m.content?.includes('[SUMMARY]: child summary'))).to.be.true;
-        });
-    });
-
     describe('sendMessage', () => {
         it('should send a message and receive a reply', async () => {
-            const ctx = createContext(fakePrompt, null, {});
+            const ctx = createMsgs(fakePrompt, {});
             ctx.pushSummary('summary 1');
 
             const reply = await ctx.sendMessage('user', 'Hello', null, {});
@@ -217,7 +159,7 @@ describe('Context', function () {
         });
 
         it('should include own prompt in standalone mode', async () => {
-            const ctx = createContext(fakePrompt, null, {});
+            const ctx = createMsgs(fakePrompt, {});
             ctx.pushSummary('child summary');
 
             await ctx.sendMessage('user', 'Hi', null, {});
@@ -228,7 +170,7 @@ describe('Context', function () {
         });
 
         it('should use preamble when passed through opts', async () => {
-            const ctx = createContext(fakePrompt, null, {});
+            const ctx = createMsgs(fakePrompt, {});
 
             const preamble = [
                 { role: 'system', content: 'Root prompt' },
@@ -250,7 +192,7 @@ describe('Context', function () {
         });
 
         it('should skip if no content', async () => {
-            const ctx = createContext(fakePrompt, null, {});
+            const ctx = createMsgs(fakePrompt, {});
             const result = await ctx.sendMessage('user', '', null, {});
             expect(result).to.be.undefined;
         });
@@ -261,7 +203,6 @@ describe('Context', function () {
         let mockSaico;
 
         beforeEach(() => {
-            const task = new Itask({ name: 'tool-test', async: true }, []);
             mockSaico = {
                 name: 'test-saico',
                 TOOL_test_tool: sandbox.stub().resolves({ content: 'tool result', functions: null }),
@@ -269,8 +210,13 @@ describe('Context', function () {
                     setTimeout(() => resolve({ content: 'slow result' }), 6000);
                 })),
             };
-            task._saico = mockSaico;
-            ctx = createContext(fakePrompt, task, {});
+            ctx = createMsgs(fakePrompt, {});
+            ctx._findToolImpl = (toolName) => {
+                const methodName = 'TOOL_' + toolName;
+                if (typeof mockSaico[methodName] === 'function')
+                    return { saico: mockSaico, methodName };
+                return null;
+            };
         });
 
         it('should handle basic tool calls', async () => {
@@ -432,7 +378,7 @@ describe('Context', function () {
         let ctx;
 
         beforeEach(() => {
-            ctx = createContext(fakePrompt, null, {});
+            ctx = createMsgs(fakePrompt, {});
         });
 
         it('should access message by index', () => {
@@ -458,49 +404,42 @@ describe('Context', function () {
     });
 
     describe('close', () => {
-        it('should summarize and bubble to parent context (via Saico)', async () => {
-            const parent = new Saico({ name: 'parent', prompt: 'Parent prompt' });
-            parent.activate({ createQ: true });
+        it('should summarize own messages', async () => {
+            const ctx = createMsgs(fakePrompt, {});
 
-            const child = new Saico({ name: 'child', prompt: fakePrompt });
-            child.activate({ createQ: true });
-            parent.spawn(child);
-
-            // Add some messages to child context
-            child.context._msgs.push({
+            ctx._msgs.push({
                 msg: { role: 'user', content: 'Hello' },
                 opts: {},
                 replied: 1
             });
-            child.context._msgs.push({
+            ctx._msgs.push({
                 msg: { role: 'assistant', content: 'Hi there' },
                 opts: {},
                 replied: 3
             });
 
-            await child.context.close();
+            await ctx.close();
 
-            // Check that summary was added to parent
-            const parentSummaries = parent.context.getSummaries();
-            expect(parentSummaries.length).to.be.greaterThan(0);
+            const summaries = ctx.getSummaries();
+            expect(summaries.length).to.be.greaterThan(0);
         });
     });
 
     describe('chat_history', () => {
         it('should accept chat_history in config', () => {
-            const ctx = new Context(fakePrompt, null, { chat_history: 'some-data' });
+            const ctx = new Msgs(fakePrompt, { chat_history: 'some-data' });
             expect(ctx._chat_history).to.equal('some-data');
         });
 
         it('should default chat_history to null', () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             expect(ctx._chat_history).to.be.null;
         });
     });
 
     describe('cleanToolCallsByTag', () => {
         it('should remove tool-related messages with matching tag', () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             const tag = 'test-tag';
 
             ctx._msgs.push(
@@ -518,7 +457,7 @@ describe('Context', function () {
         });
 
         it('should not remove messages with different tag', () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
 
             ctx._msgs.push(
                 { msg: { role: 'assistant', content: 'Tool call', tool_calls: [{ id: 'tc1' }] }, opts: { tag: 'other' }, msgid: '1', replied: 3 },
@@ -537,7 +476,7 @@ describe('Context', function () {
                 { role: 'user', content: 'Old message' },
                 { role: 'assistant', content: 'Old reply' }
             ]);
-            const ctx = new Context(fakePrompt, null, { chat_history: compressed });
+            const ctx = new Msgs(fakePrompt, { chat_history: compressed });
             await ctx.initHistory();
 
             expect(ctx._msgs).to.have.length(2);
@@ -550,7 +489,7 @@ describe('Context', function () {
             const json = JSON.stringify([
                 { role: 'user', content: 'Plain msg' }
             ]);
-            const ctx = new Context(fakePrompt, null, { chat_history: json });
+            const ctx = new Msgs(fakePrompt, { chat_history: json });
             await ctx.initHistory();
 
             expect(ctx._msgs).to.have.length(1);
@@ -558,7 +497,7 @@ describe('Context', function () {
         });
 
         it('should no-op when no chat_history', async () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             await ctx.initHistory();
             expect(ctx._msgs).to.have.length(0);
         });
@@ -567,7 +506,7 @@ describe('Context', function () {
             const compressed = await util.compressMessages([
                 { role: 'user', content: 'Should not appear' }
             ]);
-            const ctx = new Context(fakePrompt, null, {
+            const ctx = new Msgs(fakePrompt, {
                 chat_history: compressed,
                 msgs: [{ role: 'user', content: 'Existing msg' }],
             });
@@ -580,7 +519,7 @@ describe('Context', function () {
 
     describe('prepareForStorage', () => {
         it('should filter and compress messages', async () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             ctx._msgs.push(
                 { msg: { role: 'user', content: 'Hello' }, opts: {}, msgid: '1', replied: 1 },
                 { msg: { role: 'assistant', content: 'Hi', tool_calls: [{}] }, opts: {}, msgid: '2', replied: 3 },
@@ -600,7 +539,7 @@ describe('Context', function () {
         });
 
         it('should trim to QUEUE_LIMIT', async () => {
-            const ctx = new Context(fakePrompt, null, { queue_limit: 3 });
+            const ctx = new Msgs(fakePrompt, { queue_limit: 3 });
             for (let i = 0; i < 10; i++) {
                 ctx._msgs.push({
                     msg: { role: 'user', content: `msg${i}` },
@@ -615,13 +554,13 @@ describe('Context', function () {
         });
 
         it('should return null chat_history when no messages', async () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             const { chat_history } = await ctx.prepareForStorage();
             expect(chat_history).to.be.null;
         });
 
         it('should include tool_digest', async () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             ctx.tool_digest = [{ tool: 'myTool', result: 'r', tm: 1 }];
             ctx._msgs.push({ msg: { role: 'user', content: 'x' }, opts: {}, msgid: '1', replied: 1 });
 
@@ -633,12 +572,12 @@ describe('Context', function () {
 
     describe('tool_digest', () => {
         it('should initialize tool_digest as empty array', () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             expect(ctx.tool_digest).to.deep.equal([]);
         });
 
         it('_appendToolDigest() should add an entry', () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             ctx._appendToolDigest('myTool', 'result content');
             expect(ctx.tool_digest).to.have.length(1);
             expect(ctx.tool_digest[0].tool).to.equal('myTool');
@@ -647,14 +586,14 @@ describe('Context', function () {
         });
 
         it('_appendToolDigest() should truncate result to 500 chars', () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             const longResult = 'x'.repeat(600);
             ctx._appendToolDigest('myTool', longResult);
             expect(ctx.tool_digest[0].result.length).to.equal(500);
         });
 
         it('_appendToolDigest() should trim to TOOL_DIGEST_LIMIT (FIFO)', () => {
-            const ctx = new Context(fakePrompt, null, { tool_digest_limit: 3 });
+            const ctx = new Msgs(fakePrompt, { tool_digest_limit: 3 });
             ctx._appendToolDigest('tool1', 'r1');
             ctx._appendToolDigest('tool2', 'r2');
             ctx._appendToolDigest('tool3', 'r3');
@@ -667,7 +606,7 @@ describe('Context', function () {
 
     describe('_snapshotPublicProps', () => {
         it('should include non-underscore properties', () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             const obj = { name: 'test', value: 42, _internal: 'skip' };
             const snap = ctx._snapshotPublicProps(obj);
             expect(snap).to.have.property('name', 'test');
@@ -676,21 +615,21 @@ describe('Context', function () {
         });
 
         it('should skip functions', () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             const obj = { name: 'test', fn: () => {} };
             const snap = ctx._snapshotPublicProps(obj);
             expect(snap).to.not.have.property('fn');
         });
 
         it('should handle circular references without throwing', () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             const obj = { name: 'test' };
             obj.self = obj;
             expect(() => JSON.stringify(ctx._snapshotPublicProps(obj))).to.not.throw();
         });
 
         it('should recurse into objects even when serialize() is present', () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             const obj = { name: 'test', serialize: () => 'ignored' };
             const snap = ctx._snapshotPublicProps(obj);
             expect(snap).to.have.property('name', 'test');
@@ -700,7 +639,7 @@ describe('Context', function () {
 
     describe('_getQueueSlice', () => {
         it('should return all messages when fewer than limit', () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             const msgs = [
                 { role: 'user', content: 'a' },
                 { role: 'assistant', content: 'b' }
@@ -710,7 +649,7 @@ describe('Context', function () {
         });
 
         it('should return last limit messages when more exist', () => {
-            const ctx = new Context(fakePrompt, null, { min_chat_messages: 0 });
+            const ctx = new Msgs(fakePrompt, { min_chat_messages: 0 });
             const msgs = Array.from({ length: 10 }, (_, i) =>
                 ({ role: 'user', content: `msg ${i}` })
             );
@@ -720,7 +659,7 @@ describe('Context', function () {
         });
 
         it('should not orphan a tool response at start of slice', () => {
-            const ctx = new Context(fakePrompt, null, { min_chat_messages: 0 });
+            const ctx = new Msgs(fakePrompt, { min_chat_messages: 0 });
             const msgs = [];
             msgs.push({ role: 'assistant', content: 'calling', tool_calls: [{ id: 'tc1' }] });
             msgs.push({ role: 'tool', content: 'result', tool_call_id: 'tc1' });
@@ -731,7 +670,7 @@ describe('Context', function () {
         });
 
         it('should expand window to guarantee MIN_CHAT_MESSAGES', () => {
-            const ctx = new Context(fakePrompt, null, { queue_limit: 30, min_chat_messages: 10 });
+            const ctx = new Msgs(fakePrompt, { queue_limit: 30, min_chat_messages: 10 });
             const msgs2 = [];
             for (let i = 0; i < 28; i++)
                 msgs2.push({ role: 'tool', content: `tool ${i}`, tool_call_id: `tc${i}` });
@@ -747,14 +686,14 @@ describe('Context', function () {
 
     describe('_createMsgQ layered structure', () => {
         it('should have system prompt as first element (standalone fallback)', () => {
-            const ctx = createContext(fakePrompt, null, {});
+            const ctx = createMsgs(fakePrompt, {});
             ctx._msgs.push({ msg: { role: 'user', content: 'Hello' }, opts: {}, msgid: '1', replied: 1 });
             const q = ctx._createMsgQ(null, false);
             expect(q[0]).to.deep.equal({ role: 'system', content: fakePrompt });
         });
 
         it('should include tool digest in standalone fallback', () => {
-            const ctx = createContext(fakePrompt, null, {});
+            const ctx = createMsgs(fakePrompt, {});
             ctx._appendToolDigest('myTool', 'some result');
             const q = ctx._createMsgQ(null, false);
             const digestMsg = q.find(m => m.role === 'system' && m.content.includes('[Tool Activity Log]'));
@@ -764,14 +703,14 @@ describe('Context', function () {
         });
 
         it('should not include tool digest when empty (standalone fallback)', () => {
-            const ctx = createContext(fakePrompt, null, {});
+            const ctx = createMsgs(fakePrompt, {});
             const q = ctx._createMsgQ(null, false);
             const digestMsg = q.find(m => m.role === 'system' && m.content?.includes('[Tool Activity Log]'));
             expect(digestMsg).to.not.exist;
         });
 
         it('should use preamble when provided (Saico orchestration)', () => {
-            const ctx = createContext(fakePrompt, null, {});
+            const ctx = createMsgs(fakePrompt, {});
             ctx._msgs.push({ msg: { role: 'user', content: 'Hello' }, opts: {}, msgid: '1', replied: 1 });
 
             const preamble = [
@@ -789,7 +728,7 @@ describe('Context', function () {
         });
 
         it('should NOT include own prompt/digest when preamble is provided', () => {
-            const ctx = createContext(fakePrompt, null, {});
+            const ctx = createMsgs(fakePrompt, {});
             ctx._appendToolDigest('myTool', 'some result');
 
             const preamble = [{ role: 'system', content: 'Saico prompt' }];
@@ -802,7 +741,7 @@ describe('Context', function () {
         });
 
         it('should limit queue to QUEUE_LIMIT own messages', () => {
-            const ctx = createContext(fakePrompt, null, { queue_limit: 5, min_chat_messages: 0 });
+            const ctx = createMsgs(fakePrompt, { queue_limit: 5, min_chat_messages: 0 });
             for (let i = 0; i < 10; i++) {
                 ctx._msgs.push({
                     msg: { role: 'user', content: `msg ${i}` },
@@ -818,7 +757,7 @@ describe('Context', function () {
         });
 
         it('QUEUE_LIMIT should not count preamble messages', () => {
-            const ctx = createContext(fakePrompt, null, { queue_limit: 5, min_chat_messages: 0 });
+            const ctx = createMsgs(fakePrompt, { queue_limit: 5, min_chat_messages: 0 });
             for (let i = 0; i < 10; i++) {
                 ctx._msgs.push({
                     msg: { role: 'user', content: `msg ${i}` },
@@ -843,26 +782,14 @@ describe('Context', function () {
     describe('constructor with tool_digest', () => {
         it('should accept tool_digest in config', () => {
             const digest = [{ tool: 'myTool', result: 'result', tm: Date.now() }];
-            const ctx = new Context(fakePrompt, null, { tool_digest: digest });
+            const ctx = new Msgs(fakePrompt, { tool_digest: digest });
             expect(ctx.tool_digest).to.deep.equal(digest);
         });
 
         it('should default tool_digest to empty array', () => {
-            const ctx = new Context(fakePrompt, null, {});
+            const ctx = new Msgs(fakePrompt, {});
             expect(ctx.tool_digest).to.deep.equal([]);
         });
     });
 
-    describe('spawnChild', () => {
-        it('should create a child context with task', () => {
-            const parent = new Saico({ name: 'parent', prompt: fakePrompt });
-            parent.activate({ createQ: true });
-
-            const childCtx = parent.context.spawnChild('Child prompt', 'child-tag');
-
-            expect(childCtx.prompt).to.equal('Child prompt');
-            expect(childCtx.task).to.exist;
-            expect(childCtx.task.parent).to.equal(parent._task);
-        });
-    });
 });

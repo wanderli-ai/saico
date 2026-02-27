@@ -2,7 +2,7 @@
 
 const crypto = require('crypto');
 const Itask = require('./itask.js');
-const { Context } = require('./msgs.js');
+const { Msgs } = require('./msgs.js');
 const { Store } = require('./store.js');
 const util = require('./util.js');
 
@@ -47,7 +47,7 @@ class Saico {
      */
     constructor(opt = {}) {
         // Internal properties (underscore-prefixed, not persisted to Redis)
-        this._id = opt.id || crypto.randomBytes(8).toString('hex');
+        this.id = opt.id || crypto.randomBytes(8).toString('hex');
         this._task = null;
         this._store = opt.store || Store.instance || null;
         this._opt = opt;
@@ -91,7 +91,7 @@ class Saico {
         try {
             const redis = require('./redis.js');
             if (redis.rclient && opt.redis !== false) {
-                const key = 'saico:' + (opt.key || this._id);
+                const key = 'saico:' + (opt.key || this.id);
                 return redis.createObservableForRedis(key, this);
             }
         } catch (e) { /* redis not available */ }
@@ -159,37 +159,20 @@ class Saico {
             const augmentedPrompt = effectivePrompt
                 ? effectivePrompt + Saico.BACKEND_EXPLANATION
                 : '';
-            const context = new Context(augmentedPrompt, this._task, contextConfig);
-            this.setContext(context);
+            const msgs = new Msgs(augmentedPrompt, contextConfig);
+            this.context = msgs;
+            this.context_id = makeId(16);
+            msgs.tag = this.context_id;
+
+            // Wire callbacks for hierarchy access
+            msgs._findToolImpl = (toolName) => this._findToolImpl(toolName);
+            msgs._getSnapshot = () => msgs._snapshotPublicProps(this);
         }
 
         return this;
     }
 
     // ---- Context management (owned by Saico, not Itask) ----
-
-    /**
-     * Set context on this Saico instance.
-     * Generates context_id, sets context.tag, and calls context.setTask().
-     */
-    setContext(context) {
-        this.context = context;
-        // Generate context_id if not already set
-        if (!this.context_id) {
-            if (this._store)
-                this.context_id = this._store.generateId();
-            else if (Store.instance)
-                this.context_id = Store.instance.generateId();
-            else
-                this.context_id = makeId(16);
-        }
-        if (context) {
-            context.tag = this.context_id;
-            if (typeof context.setTask === 'function')
-                context.setTask(this._task);
-        }
-        return this;
-    }
 
     /**
      * Find the nearest context walking UP the Saico/task hierarchy.
@@ -444,6 +427,41 @@ class Saico {
         return parts.length > 0 ? parts : null;
     }
 
+    // ---- Tool implementation search ----
+
+    /**
+     * Search the Saico hierarchy for a TOOL_<toolName> method.
+     * Order: current task → walk UP parents → walk DOWN children (BFS).
+     */
+    _findToolImpl(toolName) {
+        const methodName = 'TOOL_' + toolName;
+        const check = (task) =>
+            task?._saico && typeof task._saico[methodName] === 'function' ? task._saico : null;
+
+        let found = check(this._task);
+        if (found) return { saico: found, methodName };
+
+        let t = this._task?.parent;
+        while (t) {
+            found = check(t);
+            if (found) return { saico: found, methodName };
+            t = t.parent;
+        }
+
+        if (this._task) {
+            const queue = [...this._task.child];
+            while (queue.length > 0) {
+                const child = queue.shift();
+                if (child._completed) continue;
+                found = check(child);
+                if (found) return { saico: found, methodName };
+                if (child.child?.size > 0) queue.push(...child.child);
+            }
+        }
+
+        return null;
+    }
+
     // ---- User Data (absorbed from Sid) ----
 
     setUserData(key, value) {
@@ -464,7 +482,7 @@ class Saico {
 
     getSessionInfo() {
         return {
-            id: this._id,
+            id: this.id,
             name: this.name,
             running: this._task?.running || false,
             completed: this._task?._completed || false,
@@ -488,7 +506,7 @@ class Saico {
         if (store && this.context) {
             const { chat_history, tool_digest } = await this.context.prepareForStorage();
             const data = {
-                id: this._id,
+                id: this.id,
                 name: this.name,
                 prompt: this.prompt,
                 userData: this.userData,
@@ -504,7 +522,7 @@ class Saico {
                     functions: this.context.functions,
                 },
             };
-            await store.save(this._id, data);
+            await store.save(this.id, data);
         }
 
         this._task._ecancel();
@@ -617,7 +635,7 @@ class Saico {
      */
     serialize() {
         const data = {
-            id: this._id,
+            id: this.id,
             name: this.name,
             prompt: this.prompt,
             userData: this.userData,
