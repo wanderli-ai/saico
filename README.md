@@ -1,13 +1,13 @@
 # Saico - Hierarchical AI Conversation Orchestrator
 
-Saico is a Node.js library for building AI agents with hierarchical conversations, automatic context aggregation, and enterprise-grade tool calling. It manages nested task trees where each node can have its own conversation context, system prompt, tools, and state — and the library automatically assembles the full payload sent to the LLM by walking the tree.
+Saico is a Node.js library for building AI agents with hierarchical conversations, automatic context aggregation, and enterprise-grade tool calling. It manages nested task trees where each node can have its own message queue, system prompt, tools, and state — and the library automatically assembles the full payload sent to the LLM by walking the tree.
 
 ## Features
 
 - **Hierarchical conversations** — Parent-child task trees with automatic prompt, tool, and state summary aggregation
 - **Token-aware summarization** — Automatic summarization when message history approaches token limits
 - **Tool calling** — Depth control, deferred execution, duplicate detection, repetition prevention, and timeout handling
-- **Pluggable storage** — Optional Redis persistence (auto-save via proxy) and pluggable DB backends (DynamoDB adapter included)
+- **Pluggable storage** — Optional Redis persistence (auto-save via proxy), library-level backend registration (`Saico.registerBackend`), and pluggable DB backends (DynamoDB adapter included)
 - **Isolation boundaries** — `opt.isolate` stops ancestor aggregation at any node in the tree
 - **Serialization** — Full state save/restore for long-running agents
 
@@ -54,7 +54,7 @@ agent.activate({ createQ: true });
 // Backend message (prefixed with [BACKEND] automatically)
 const reply = await agent.sendMessage('What is the weather in Tokyo?');
 
-// User-facing chat message (routed to deepest active context)
+// User-facing chat message (routed to deepest active msgs Q)
 const chatReply = await agent.recvChatMessage('Hello!');
 ```
 
@@ -83,7 +83,7 @@ agent.activate();
 await agent.sendMessage('Do something');
 await agent.recvChatMessage('User says hello');
 
-// 4. Deactivate — bubbles cleaned messages to parent, closes context
+// 4. Deactivate — bubbles cleaned messages to parent, closes msgs Q
 await agent.deactivate();
 ```
 
@@ -124,7 +124,7 @@ Root Saico (prompt: "You are a manager")
     Functions aggregated from all levels.
 ```
 
-- **`sendMessage(content, functions, opts)`** — Sends a backend message (auto-prefixed `[BACKEND]`). Uses the current or nearest ancestor context.
+- **`sendMessage(content, functions, opts)`** — Sends a backend message (auto-prefixed `[BACKEND]`). Uses the current or nearest ancestor msgs Q.
 - **`recvChatMessage(content, opts)`** — Routes a user chat message DOWN to the deepest descendant with a message queue.
 
 ### Isolation
@@ -151,12 +151,12 @@ class OrderAgent extends Saico {
 }
 ```
 
-When a Saico's context is not the deepest active one, its last 5 user/assistant messages are also included in the state summary automatically.
+When a Saico's msgs Q is not the deepest active one, its last 5 user/assistant messages are also included in the state summary automatically.
 
 ### Spawning Child Saico Instances
 
 ```js
-// Child with its own conversation context (auto-activated by spawn)
+// Child with its own msgs Q (auto-activated by spawn)
 const child = new Saico({
     name: 'subtask',
     prompt: 'Handle this specific sub-task',
@@ -166,7 +166,7 @@ const child = new Saico({
 agent.spawn(child);
 await child.sendMessage('Working on subtask...');
 
-// Child without context (uses parent's via findContext())
+// Child without msgs Q (uses parent's via findMsgs())
 const simple = new Saico({ name: 'simple' });
 agent.spawn(simple);
 await simple.sendMessage('Quick operation');
@@ -210,7 +210,8 @@ new Saico({
     // Storage
     redis: true,               // Set false to skip Redis proxy
     key: 'custom-redis-key',
-    dynamodb: {                // DynamoDB config (creates adapter)
+    store: 'my-table',         // Table name for instance persistence (closeSession/rehydrate)
+    dynamodb: {                // DynamoDB config (creates instance-level adapter)
         region: 'us-east-1',
         credentials: { accessKeyId: '...', secretAccessKey: '...' },
     },
@@ -257,15 +258,15 @@ agent.getSessionInfo();
 //   userData, uptime
 // }
 
-await agent.closeSession();  // Saves full state to Store, cancels task
+await agent.closeSession();  // prepareForStorage + save to registered backend, cancels task
 
-// Restore from Store
-const restored = await Saico.rehydrate(agent.id, { store });
+// Restore from registered backend
+const restored = await Saico.rehydrate(agent.id, { store: 'sessions' });
 ```
 
 ## Database Access
 
-Saico provides backend-agnostic DB methods. Configure via `opt.dynamodb` (auto-creates DynamoDB adapter) or `opt.db` (any adapter). Table name is required on every call. Child Saico instances without their own DB inherit the parent's adapter automatically via `_getDb()`.
+Saico provides backend-agnostic DB methods. Configure via `Saico.registerBackend('dynamodb', config)` (library-level), `opt.dynamodb` (instance-level auto-creates adapter), or `opt.db` (any adapter). Table name is required on every call. Child Saico instances without their own DB inherit the parent's adapter automatically via `_getDb()`, which also falls back to the registered backend.
 
 ```js
 // CRUD — table name required on every call
@@ -300,28 +301,42 @@ class MyAgent extends Saico {
 
 ## Serialization
 
-```js
-// In-memory snapshot (raw msgs, used by Redis proxy)
-const json = agent.serialize();
-const restored = Saico.deserialize(json);
+Both `serialize()` and `Saico.deserialize()` are async. `serialize()` calls `prepareForStorage()` first (strips `_` props, skips functions/states, compresses msgs) then `JSON.stringify`s the result.
 
-// Durable persistence (compressed msgs, saved to Store)
+```js
+// prepareForStorage — clean snapshot
+const data = await agent.prepareForStorage();
+
+// serialize/deserialize
+const json = await agent.serialize();
+const restored = await Saico.deserialize(json);
+
+// Durable persistence (uses registered backend + opt.store table name)
 await agent.closeSession();
-const restored2 = await Saico.rehydrate(agent.id, { store });
+const restored2 = await Saico.rehydrate(agent.id, { store: 'sessions' });
 ```
 
-`serialize()` includes: id, name, prompt, userData, sessionConfig, tm_create, isolate, and full context state (raw messages, tool_digest). `closeSession()` saves the same shape but with compressed messages for durable storage.
+`prepareForStorage()` automatically picks up all non-underscore properties (id, name, prompt, userData, sessionConfig, tm_create, isolate, etc.) and produces compressed chat_history for the msgs Q.
+
+## Initialization
+
+```js
+const { Saico, init } = require('saico');
+
+// Initialize Redis (default: enabled) and register DynamoDB backend
+await init({
+    dynamodb: { region: 'us-east-1', credentials: { accessKeyId: 'AK', secretAccessKey: 'SK' } },
+});
+
+// Or register backend directly
+Saico.registerBackend('dynamodb', { region: 'us-east-1', credentials: { ... } });
+```
 
 ## Redis Persistence
 
-When Redis is initialized, Saico instances are automatically wrapped in an observable proxy. Any property change triggers a debounced save to Redis.
+When Redis is initialized (default: enabled via `init()`), Saico instances are automatically wrapped in an observable proxy. Any property change triggers a debounced save to Redis.
 
 ```js
-const { init } = require('saico');
-
-// Initialize with Redis
-await init({ redis: true });
-
 const agent = new Saico({ name: 'persistent-agent' });
 agent.someProperty = 'value';  // Auto-saved to Redis
 ```
@@ -374,11 +389,11 @@ const reply = await ctx.sendMessage('user', 'Hello', functions);
 ```
 saico/
 +-- index.js      # Thin barrel file, exports all components
-+-- saico.js      # Saico master class — owns context, spawn, DB, orchestration
++-- saico.js      # Saico master class — owns msgs Q, spawn, DB, orchestration
 +-- itask.js      # Pure task runner — hierarchy, states, cancellation, promises
 +-- msgs.js       # Conversation context (message queue, tool calls, summarization)
 +-- dynamo.js     # DynamoDB storage adapter
-+-- store.js      # Storage abstraction (Redis + pluggable backends)
++-- store.js      # Minimal storage shell (Redis helper + ID generation)
 +-- openai.js     # OpenAI API wrapper with retry logic
 +-- redis.js      # Redis persistence with observable proxy
 +-- util.js       # Utilities (token counting, logging)
@@ -390,7 +405,7 @@ saico/
 npm test
 ```
 
-290 tests covering Saico lifecycle, context ownership, spawn/spawnAndRun, task hierarchy, message handling, tool calls, DB adapters, serialization, persistence (closeSession/rehydrate), and integration flows.
+300 tests covering Saico lifecycle, msgs Q ownership, spawn/spawnAndRun, task hierarchy, message handling, tool calls, DB adapters, async serialization, prepareForStorage, backend registration, persistence (closeSession/rehydrate via registered backend), storage integration, and full hierarchy flows.
 
 ## Requirements
 

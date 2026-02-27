@@ -136,12 +136,14 @@ describe('Msgs', function () {
     });
 
     describe('serialize', () => {
-        it('should serialize the object', () => {
+        it('should serialize the object', async () => {
             const ctx = createMsgs(fakePrompt, {});
             ctx.push({ role: 'user', content: 'Hi' });
-            const json = ctx.serialize();
+            const json = await ctx.serialize();
             expect(json).to.be.a('string');
-            expect(JSON.parse(json)).to.be.an('array');
+            const parsed = JSON.parse(json);
+            expect(parsed).to.have.property('chat_history');
+            expect(parsed).to.have.property('tool_digest');
         });
     });
 

@@ -393,7 +393,15 @@ class Msgs {
         return this._msgs.length;
     }
 
-    serialize() { return JSON.stringify(this._msgs); }
+    async serialize() {
+        const { chat_history, tool_digest } = await this.prepareForStorage();
+        return JSON.stringify({
+            tag: this.tag,
+            chat_history,
+            tool_digest,
+            functions: this.functions,
+        });
+    }
 
     getSummaries() { return this._msgs.filter(m => m.opts.summary); }
 

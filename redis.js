@@ -39,11 +39,13 @@ function createObservableForRedis(key, obj) {
     let lastSavedObject = null; // Cache for the last-saved sanitized object
     let lastSavedTimestamp = null; // Timestamp of the last save to Redis
 
-    const saveToRedis = debounce(() => {
+    const saveToRedis = debounce(async () => {
         const sanitizedObj = sanitizeObject(obj);
 
         // Compare sanitized object with the last-saved object
-        if (serialize(sanitizedObj) === serialize(lastSavedObject)) {
+        const serializedNew = await serialize(sanitizedObj);
+        const serializedOld = await serialize(lastSavedObject);
+        if (serializedNew === serializedOld) {
             logDebug("No changes detected, skipping save.");
             return;
         }
@@ -51,7 +53,7 @@ function createObservableForRedis(key, obj) {
         lastSavedObject = sanitizedObj;
         lastSavedTimestamp = Date.now(); // Update the last saved timestamp
 		sanitizedObj.lastSave = lastSavedTimestamp;
-        rclient.set(key, serialize(sanitizedObj));
+        await rclient.set(key, serializedNew);
         logDebug("Saved to Redis:", key, `at ${lastSavedTimestamp}`);
     }, 1000);
 
@@ -100,9 +102,9 @@ function createObservableForRedis(key, obj) {
         },
     };
 
-    function serialize(obj) {
+    async function serialize(obj) {
 		if (typeof obj == 'object' && typeof obj?.serialize == 'function')
-			return obj.serialize();
+			return await obj.serialize();
         return JSON.stringify(obj);
 	}
 

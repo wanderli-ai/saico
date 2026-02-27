@@ -5,7 +5,7 @@ const sinon = require('sinon');
 const expect = chai.expect;
 
 const saico = require('../index.js');
-const { Itask, Msgs, Saico, Store, createMsgs } = saico;
+const { Itask, Msgs, Saico, Store, createMsgs, DynamoDBAdapter } = saico;
 const openai = require('../openai.js');
 const util = require('../util.js');
 
@@ -29,6 +29,7 @@ describe('Integration Tests', function () {
         sandbox.restore();
         Itask.root.clear();
         Store.instance = null;
+        Saico._backend = null;
     });
 
     describe('Module exports', () => {
@@ -73,7 +74,7 @@ describe('Integration Tests', function () {
             session.activate({ createQ: true });
 
             // Add summary to session context
-            session.context.pushSummary('Previous conversation summary');
+            session.msgs.pushSummary('Previous conversation summary');
 
             // Create child Saico with context
             const child = new Saico({
@@ -259,22 +260,22 @@ describe('Integration Tests', function () {
             session.spawn(child);
 
             // Add some conversation to child
-            child.context._msgs.push({
+            child.msgs._msgs.push({
                 msg: { role: 'user', content: 'Hello from child' },
                 opts: {},
                 replied: 1
             });
-            child.context._msgs.push({
+            child.msgs._msgs.push({
                 msg: { role: 'assistant', content: 'Hi there!' },
                 opts: {},
                 replied: 3
             });
 
-            const parentMsgsBefore = session.context._msgs.length;
+            const parentMsgsBefore = session.msgs._msgs.length;
             await child.deactivate();
 
             // Parent should have gained the user and assistant messages
-            const newMsgs = session.context._msgs.slice(parentMsgsBefore);
+            const newMsgs = session.msgs._msgs.slice(parentMsgsBefore);
             expect(newMsgs.length).to.equal(2);
             expect(newMsgs[0].msg.content).to.equal('Hello from child');
             expect(newMsgs[1].msg.content).to.equal('Hi there!');
@@ -282,7 +283,7 @@ describe('Integration Tests', function () {
     });
 
     describe('Serialization Round-Trip', () => {
-        it('should preserve state through serialization', () => {
+        it('should preserve state through serialization', async () => {
             const original = new Saico({
                 name: 'test-session',
                 prompt: 'Test prompt',
@@ -290,18 +291,18 @@ describe('Integration Tests', function () {
             });
             original.activate({ createQ: true });
 
-            original.context.push({ role: 'user', content: 'Hello' });
-            original.context.push({ role: 'assistant', content: 'Hi!' });
-            original.context.pushSummary('Previous summary');
+            original.msgs.push({ role: 'user', content: 'Hello' });
+            original.msgs.push({ role: 'assistant', content: 'Hi!' });
+            original.msgs.pushSummary('Previous summary');
 
-            const serialized = original.serialize();
-            const restored = Saico.deserialize(serialized);
+            const serialized = await original.serialize();
+            const restored = await Saico.deserialize(serialized);
 
             expect(restored.name).to.equal(original.name);
             expect(restored.prompt).to.equal(original.prompt);
             expect(restored.id).to.equal(original.id);
             expect(restored.userData).to.deep.equal(original.userData);
-            expect(restored.context.length).to.equal(original.context.length);
+            expect(restored.msgs).to.exist;
         });
     });
 
@@ -413,20 +414,20 @@ describe('Integration Tests', function () {
         });
     });
 
-    describe('Context ID and Message Tagging', () => {
-        it('should generate context_id for Saico with context', () => {
+    describe('Msgs ID and Message Tagging', () => {
+        it('should generate msgs_id for Saico with msgs Q', () => {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
             });
             session.activate({ createQ: true });
 
-            expect(session.context_id).to.be.a('string');
-            expect(session.context_id.length).to.be.greaterThan(0);
-            expect(session.context.tag).to.equal(session.context_id);
+            expect(session.msgs_id).to.be.a('string');
+            expect(session.msgs_id.length).to.be.greaterThan(0);
+            expect(session.msgs.tag).to.equal(session.msgs_id);
         });
 
-        it('should generate distinct context_id for child', () => {
+        it('should generate distinct msgs_id for child', () => {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
@@ -440,11 +441,11 @@ describe('Integration Tests', function () {
             child.activate({ createQ: true });
             session.spawn(child);
 
-            expect(child.context_id).to.be.a('string');
-            expect(child.context_id).to.not.equal(session.context_id);
+            expect(child.msgs_id).to.be.a('string');
+            expect(child.msgs_id).to.not.equal(session.msgs_id);
         });
 
-        it('should tag messages with context_id via sendMessage', async () => {
+        it('should tag messages with msgs_id via sendMessage', async () => {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
@@ -453,13 +454,13 @@ describe('Integration Tests', function () {
 
             await session.sendMessage('Backend instruction');
 
-            const backendMsg = session.context._msgs.find(m =>
+            const backendMsg = session.msgs._msgs.find(m =>
                 m.msg.content === '[BACKEND] Backend instruction');
             expect(backendMsg).to.exist;
-            expect(backendMsg.opts.tag).to.equal(session.context_id);
+            expect(backendMsg.opts.tag).to.equal(session.msgs_id);
         });
 
-        it('should tag messages with context_id via recvChatMessage', async () => {
+        it('should tag messages with msgs_id via recvChatMessage', async () => {
             const session = new Saico({
                 name: 'session',
                 prompt: 'Session prompt',
@@ -468,10 +469,10 @@ describe('Integration Tests', function () {
 
             await session.recvChatMessage('User chat message');
 
-            const chatMsg = session.context._msgs.find(m =>
+            const chatMsg = session.msgs._msgs.find(m =>
                 m.msg.content === 'User chat message');
             expect(chatMsg).to.exist;
-            expect(chatMsg.opts.tag).to.equal(session.context.tag);
+            expect(chatMsg.opts.tag).to.equal(session.msgs.tag);
         });
     });
 
@@ -574,9 +575,9 @@ describe('Integration Tests', function () {
 
             await session.recvChatMessage('Do something dirty');
 
-            expect(session.context.tool_digest).to.have.length(1);
-            expect(session.context.tool_digest[0].tool).to.equal('dirty_tool');
-            expect(session.context.tool_digest[0].result).to.equal('dirty result');
+            expect(session.msgs.tool_digest).to.have.length(1);
+            expect(session.msgs.tool_digest[0].tool).to.equal('dirty_tool');
+            expect(session.msgs.tool_digest[0].result).to.equal('dirty result');
         });
 
         it('should not populate tool_digest when handler mutates nothing on the task', async () => {
@@ -600,7 +601,7 @@ describe('Integration Tests', function () {
 
             await session.recvChatMessage('Do something normal');
 
-            expect(session.context.tool_digest).to.have.length(0);
+            expect(session.msgs.tool_digest).to.have.length(0);
         });
 
         it('should include tool digest in subsequent OpenAI calls', async () => {
@@ -611,7 +612,7 @@ describe('Integration Tests', function () {
             session.activate({ createQ: true });
 
             // Pre-populate tool_digest
-            session.context._appendToolDigest('prev_tool', 'previous result');
+            session.msgs._appendToolDigest('prev_tool', 'previous result');
 
             await session.recvChatMessage('Hello');
 
@@ -632,12 +633,12 @@ describe('Integration Tests', function () {
                 prompt: 'Session prompt',
             });
             session.activate({ createQ: true });
-            session.context.QUEUE_LIMIT = 10;
-            session.context.MIN_CHAT_MESSAGES = 0;
+            session.msgs.QUEUE_LIMIT = 10;
+            session.msgs.MIN_CHAT_MESSAGES = 0;
 
             // Push 20 messages directly
             for (let i = 0; i < 20; i++) {
-                session.context._msgs.push({
+                session.msgs._msgs.push({
                     msg: { role: 'user', content: `old msg ${i}` },
                     opts: {},
                     msgid: `old${i}`,
@@ -657,17 +658,18 @@ describe('Integration Tests', function () {
     describe('Full Persistence Flow', () => {
         it('should create session, send messages, close, and rehydrate', async () => {
             const saved = {};
-            const mockStore = {
-                save: sinon.stub().callsFake((id, data) => { saved[id] = data; }),
-                load: sinon.stub().callsFake((id) => saved[id] || null),
+            const mockBackend = {
+                put: sinon.stub().callsFake((data, table) => { saved[data.id] = data; }),
+                get: sinon.stub().callsFake((key, id, table) => saved[id] || undefined),
             };
+            Saico._backend = mockBackend;
 
             const session = new Saico({
                 id: 'persist-id',
                 name: 'persist-session',
                 prompt: 'Session prompt',
+                store: 'sessions-table',
             });
-            session._store = mockStore;
             session.activate({ createQ: true });
 
             // Send backend message
@@ -676,37 +678,37 @@ describe('Integration Tests', function () {
             // Send user chat message
             await session.recvChatMessage('I want to book a hotel');
 
-            // Verify both types are in the context
-            const backendMsg = session.context._msgs.find(m =>
+            // Verify both types are in the msgs Q
+            const backendMsg = session.msgs._msgs.find(m =>
                 m.msg.content === '[BACKEND] Check booking');
             expect(backendMsg).to.exist;
 
-            const chatMsg = session.context._msgs.find(m =>
+            const chatMsg = session.msgs._msgs.find(m =>
                 m.msg.content === 'I want to book a hotel');
             expect(chatMsg).to.exist;
 
-            // Close — saves compressed state to store
+            // Close — saves compressed state to registered backend
             await session.closeSession();
 
-            expect(mockStore.save.calledOnce).to.be.true;
-            const [key, data] = mockStore.save.firstCall.args;
-            expect(key).to.equal('persist-id');
-            expect(data.context.chat_history).to.be.a('string');
-            expect(data.context.msgs).to.be.undefined;
+            expect(mockBackend.put.calledOnce).to.be.true;
+            const [data, table] = mockBackend.put.firstCall.args;
+            expect(table).to.equal('sessions-table');
+            expect(data.id).to.equal('persist-id');
+            expect(data.msgs.chat_history).to.be.a('string');
 
-            // Rehydrate — restore from store
-            const restored = await Saico.rehydrate('persist-id', { store: mockStore });
+            // Rehydrate — restore from registered backend
+            const restored = await Saico.rehydrate('persist-id', { store: 'sessions-table' });
             expect(restored.id).to.equal('persist-id');
             expect(restored.name).to.equal('persist-session');
-            expect(restored.context).to.exist;
+            expect(restored.msgs).to.exist;
 
             // Verify chat msg survived (backend msgs are filtered out by prepareForStorage)
-            const restoredChat = restored.context._msgs.find(m =>
+            const restoredChat = restored.msgs._msgs.find(m =>
                 m.msg.content === 'I want to book a hotel');
             expect(restoredChat).to.exist;
 
             // Backend msg should not be in restored (filtered by prepareForStorage)
-            const restoredBackend = restored.context._msgs.find(m =>
+            const restoredBackend = restored.msgs._msgs.find(m =>
                 m.msg.content && m.msg.content.includes('[BACKEND]'));
             expect(restoredBackend).to.not.exist;
         });

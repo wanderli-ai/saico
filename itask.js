@@ -534,6 +534,9 @@ Itask.prototype.continue = function(ret){
     return this;
 };
 
+/* ---------- serialization ---------- */
+Itask.prototype.serialize = function(){ return JSON.stringify({}); };
+
 /* ---------- introspection / ps ---------- */
 Itask.prototype.is_running = function(){ return this.running && !this._completed; };
 Itask.prototype.is_completed = function(){ return this._completed; };

@@ -3,7 +3,6 @@
 const crypto = require('crypto');
 const Itask = require('./itask.js');
 const { Msgs } = require('./msgs.js');
-const { Store } = require('./store.js');
 const util = require('./util.js');
 
 function makeId(len = 12){
@@ -19,7 +18,7 @@ function makeId(len = 12){
  *   - Construction: sets up storage (Redis observable + optional DynamoDB),
  *     class-level prompt, tool config. No Itask is created yet.
  *   - activate(opts): creates the internal Itask and optionally attaches a
- *     message Q context (when opts.createQ is true).
+ *     message Q (when opts.createQ is true).
  *   - DB access works before and after activation.
  *
  * Saico orchestrates the full message payload sent to the LLM by walking its
@@ -37,11 +36,11 @@ class Saico {
      * @param {Array} [opt.functions] - Available AI functions
      * @param {string} [opt.key] - Redis key override (default: 'saico:<id>')
      * @param {boolean} [opt.redis=true] - Set false to skip Redis proxy
-     * @param {boolean} [opt.createQ] - Create message Q context on activate()
+     * @param {boolean} [opt.createQ] - Create message Q on activate()
      * @param {boolean} [opt.isolate] - Isolate: don't aggregate from ancestors
      * @param {Object} [opt.dynamodb] - DynamoDB config { region, credentials: { accessKeyId, secretAccessKey }, client }
      * @param {Object} [opt.db] - Pluggable DB backend
-     * @param {Object} [opt.store] - Store instance override
+     * @param {string} [opt.store] - Table name for instance persistence
      * @param {Object} [opt.userData] - Initial user data
      * @param {Object} [opt.sessionConfig] - Session config overrides
      */
@@ -49,13 +48,13 @@ class Saico {
         // Internal properties (underscore-prefixed, not persisted to Redis)
         this.id = opt.id || crypto.randomBytes(8).toString('hex');
         this._task = null;
-        this._store = opt.store || Store.instance || null;
+        this._storeName = (typeof opt.store === 'string') ? opt.store : null;
         this._opt = opt;
-        this._isolate = opt.isolate || false;
+        this.isolate = opt.isolate || false;
 
-        // Context owned directly by Saico (not Itask)
-        this.context = null;
-        this.context_id = null;
+        // Msgs Q owned directly by Saico (not Itask)
+        this.msgs = null;
+        this.msgs_id = null;
 
         // Public configuration
         this.name = opt.name || this.constructor.name || 'saico';
@@ -98,7 +97,7 @@ class Saico {
     }
 
     /**
-     * Create the internal Itask and optionally a message Q context.
+     * Create the internal Itask and optionally a message Q.
      *
      * @param {Object} opts
      * @param {boolean} [opts.createQ] - Override this.createQ for this activation
@@ -106,7 +105,7 @@ class Saico {
      * @param {Array} [opts.functions] - Override functions
      * @param {Array} [opts.states] - Override this.states for this activation
      * @param {string} [opts.taskId] - Custom task ID
-     * @param {number} [opts.token_limit] - Token limit for context
+     * @param {number} [opts.token_limit] - Token limit for msgs Q
      * @param {number} [opts.max_depth] - Max tool call depth
      * @param {number} [opts.max_tool_repetition] - Max tool repetition
      * @param {number} [opts.queue_limit] - Message queue limit
@@ -114,14 +113,22 @@ class Saico {
      * @param {boolean} [opts.sequential_mode] - Sequential message processing
      * @param {Array} [opts.msgs] - Initial messages
      * @param {*} [opts.chat_history] - Chat history to restore
-     * @param {Object} [opts.contextConfig] - Additional Context config overrides
+     * @param {Object} [opts.msgsConfig] - Additional Msgs config overrides
      * @returns {Saico} this instance (for chaining)
      */
     activate(opts = {}) {
         if (this._task)
             throw new Error('Already activated. Call deactivate() first.');
 
-        const states = opts.states || this.states || [];
+        const defaultStates = [
+            async function main() {
+                return this._task.wait();
+            },
+            async function catch$error_handler(err) {
+                console.error(`${this.name} caught error:`, err);
+            },
+        ];
+        const states = opts.states || this.states || defaultStates;
 
         // Build effective prompt: class-level + activation-level
         const effectivePrompt = [this.prompt, opts.prompt].filter(Boolean).join('\n');
@@ -138,10 +145,10 @@ class Saico {
         // Store Saico reference on task for parent chain traversal
         this._task._saico = this;
 
-        // Create message Q context if requested (class-level or activate-level)
+        // Create message Q if requested (class-level or activate-level)
         if (opts.createQ ?? this.createQ) {
             const functions = opts.functions || this.functions;
-            const contextConfig = {
+            const msgsConfig = {
                 tag: opts.tag || this._task.id,
                 token_limit: opts.token_limit ?? this.sessionConfig.token_limit,
                 max_depth: opts.max_depth ?? this.sessionConfig.max_depth,
@@ -153,16 +160,16 @@ class Saico {
                 msgs: opts.msgs,
                 chat_history: opts.chat_history,
                 tool_digest: opts.tool_digest,
-                ...opts.contextConfig,
+                ...opts.msgsConfig,
             };
 
             const augmentedPrompt = effectivePrompt
                 ? effectivePrompt + Saico.BACKEND_EXPLANATION
                 : '';
-            const msgs = new Msgs(augmentedPrompt, contextConfig);
-            this.context = msgs;
-            this.context_id = makeId(16);
-            msgs.tag = this.context_id;
+            const msgs = new Msgs(augmentedPrompt, msgsConfig);
+            this.msgs = msgs;
+            this.msgs_id = makeId(16);
+            msgs.tag = this.msgs_id;
 
             // Wire callbacks for hierarchy access
             msgs._findToolImpl = (toolName) => this._findToolImpl(toolName);
@@ -175,63 +182,63 @@ class Saico {
     // ---- Context management (owned by Saico, not Itask) ----
 
     /**
-     * Find the nearest context walking UP the Saico/task hierarchy.
+     * Find the nearest msgs Q walking UP the Saico/task hierarchy.
      */
-    findContext() {
-        if (this.context) return this.context;
+    findMsgs() {
+        if (this.msgs) return this.msgs;
         let task = this._task?.parent;
         while (task) {
-            if (task._saico?.context) return task._saico.context;
+            if (task._saico?.msgs) return task._saico.msgs;
             task = task.parent;
         }
         return null;
     }
 
     /**
-     * Walk DOWN to find the deepest active descendant with a context.
+     * Walk DOWN to find the deepest active descendant with a msgs Q.
      */
-    findDeepestContext() {
-        if (!this._task) return this.context || null;
-        let deepest = this.context ? { context: this.context, depth: 0 } : null;
+    findDeepestMsgs() {
+        if (!this._task) return this.msgs || null;
+        let deepest = this.msgs ? { msgs: this.msgs, depth: 0 } : null;
         const search = (task, depth) => {
             for (const child of task.child) {
                 if (child._completed) continue;
-                if (child._saico?.context) {
+                if (child._saico?.msgs) {
                     if (!deepest || depth + 1 >= deepest.depth)
-                        deepest = { context: child._saico.context, depth: depth + 1 };
+                        deepest = { msgs: child._saico.msgs, depth: depth + 1 };
                 }
                 search(child, depth + 1);
             }
         };
         search(this._task, 0);
-        return deepest ? deepest.context : null;
+        return deepest ? deepest.msgs : null;
     }
 
     /**
-     * Deactivate — bubble cleaned messages to parent, close context, cancel task.
+     * Deactivate — bubble cleaned messages to parent, close msgs Q, cancel task.
      * Pushes cleaned messages (no tool calls, no BACKEND) into the parent's Q,
-     * then closes the context without the default summary bubbling.
+     * then closes the msgs Q without the default summary bubbling.
      */
     async deactivate() {
         if (!this._task) return;
-        if (this.context) {
-            // Find parent context to bubble cleaned messages
+        if (this.msgs) {
+            // Find parent msgs to bubble cleaned messages
             let parentTask = this._task.parent;
-            let parentCtx = null;
+            let parentMsgs = null;
             while (parentTask) {
-                if (parentTask._saico?.context) { parentCtx = parentTask._saico.context; break; }
+                if (parentTask._saico?.msgs) { parentMsgs = parentTask._saico.msgs; break; }
                 parentTask = parentTask.parent;
             }
-            if (parentCtx) {
+            if (parentMsgs) {
                 const cleaned = this.getRecentMessages(Infinity);
                 for (const msg of cleaned)
-                    parentCtx.push(msg);
+                    parentMsgs.push(msg);
             }
-            // Clean tool calls and close context without additional summary bubbling.
-            if (this.context_id && typeof this.context.cleanToolCallsByTag === 'function')
-                this.context.cleanToolCallsByTag(this.context_id);
-            this.context = null;
-            this.context_id = null;
+            // Clean tool calls and close msgs Q without additional summary bubbling.
+            if (this.msgs_id && typeof this.msgs.cleanToolCallsByTag === 'function')
+                this.msgs.cleanToolCallsByTag(this.msgs_id);
+            this.msgs = null;
+            this.msgs_id = null;
         }
         this._task._ecancel();
         this._task = null;
@@ -276,7 +283,7 @@ class Saico {
      */
     _getSaicoAncestors() {
         const chain = [this];
-        if (this._isolate) return chain;
+        if (this.isolate) return chain;
         let task = this._task?.parent;
         while (task) {
             if (task._saico) {
@@ -290,7 +297,7 @@ class Saico {
 
     /**
      * Build preamble and aggregated functions by walking the Saico chain.
-     * @param {Context} activeCtx - The deepest active context (for state summary logic)
+     * @param {Msgs} activeCtx - The deepest active msgs Q (for state summary logic)
      * @returns {{ preamble: Array, allFunctions: Array }}
      */
     _buildPreamble(activeCtx) {
@@ -317,8 +324,8 @@ class Saico {
             }
 
             // Tools digest
-            if (saico.context?.tool_digest?.length > 0) {
-                const digestText = saico.context.tool_digest.map(entry =>
+            if (saico.msgs?.tool_digest?.length > 0) {
+                const digestText = saico.msgs.tool_digest.map(entry =>
                     `[${new Date(entry.tm).toISOString()}] ${entry.tool}: ${entry.result}`
                 ).join('\n');
                 preamble.push({ role: 'system', content: '[Tool Activity Log]\n' + digestText });
@@ -337,20 +344,20 @@ class Saico {
         if (!this._task)
             throw new Error('Not activated. Call activate() first.');
 
-        // Find the active context (own or walk up)
-        let ctx = this.findContext();
+        // Find the active msgs Q (own or walk up)
+        let ctx = this.findMsgs();
         if (!ctx)
-            throw new Error('No context available');
+            throw new Error('No msgs Q available');
 
         // Build preamble by walking Saico chain
-        const activeCtx = this.findDeepestContext() || ctx;
+        const activeCtx = this.findDeepestMsgs() || ctx;
         const { preamble, allFunctions } = this._buildPreamble(activeCtx);
 
         // Merge with call-specific functions
         if (functions) allFunctions.push(...(Array.isArray(functions) ? functions : [functions]));
 
         opts = Object.assign({}, opts, {
-            tag: this.context_id,
+            tag: this.msgs_id,
             _preamble: preamble,
             _aggregatedFunctions: allFunctions.length > 0 ? allFunctions : null,
         });
@@ -362,9 +369,9 @@ class Saico {
             throw new Error('Not activated. Call activate() first.');
 
         // Route DOWN to deepest descendant with a msg Q
-        const ctx = this.findDeepestContext();
+        const ctx = this.findDeepestMsgs();
         if (!ctx)
-            throw new Error('No context available');
+            throw new Error('No msgs Q available');
 
         // Build preamble by walking Saico chain
         const { preamble, allFunctions } = this._buildPreamble(ctx);
@@ -396,8 +403,8 @@ class Saico {
      * @returns {Array<{role: string, content: string}>}
      */
     getRecentMessages(n = 5) {
-        if (!this.context) return [];
-        return this.context._msgs
+        if (!this.msgs) return [];
+        return this.msgs._msgs
             .filter(m => {
                 if (m.msg.role === 'tool' || m.msg.tool_calls) return false;
                 if (typeof m.msg.content === 'string' && m.msg.content.startsWith('[BACKEND]')) return false;
@@ -409,8 +416,8 @@ class Saico {
 
     /**
      * Internal state summary builder. Includes own getStateSummary() and,
-     * if this context is NOT the active (deepest) Q, includes recent messages.
-     * @param {Context} activeCtx - The deepest active context
+     * if this msgs Q is NOT the active (deepest) Q, includes recent messages.
+     * @param {Msgs} activeCtx - The deepest active msgs Q
      * @returns {Array|string|null}
      */
     _getStateSummary(activeCtx) {
@@ -418,8 +425,8 @@ class Saico {
         const own = this.getStateSummary();
         if (own) parts.push(own);
 
-        // If this context is NOT the active (deepest) Q, include recent messages
-        if (this.context && activeCtx && this.context !== activeCtx) {
+        // If this msgs Q is NOT the active (deepest) Q, include recent messages
+        if (this.msgs && activeCtx && this.msgs !== activeCtx) {
             const recent = this.getRecentMessages(5);
             if (recent.length > 0) parts.push(...recent);
         }
@@ -486,7 +493,7 @@ class Saico {
             name: this.name,
             running: this._task?.running || false,
             completed: this._task?._completed || false,
-            messageCount: this.context?.length || 0,
+            messageCount: this.msgs?.length || 0,
             childCount: this._task?.child?.size || 0,
             userData: this.userData,
             uptime: Date.now() - this.tm_create,
@@ -494,35 +501,17 @@ class Saico {
     }
 
     /**
-     * Close the session — compress msgs, save full state to Store, cancel task.
-     * The saved object has the same shape as serialize() but with compressed
-     * context messages (chat_history) instead of raw _msgs.
+     * Close the session — save state to registered backend, cancel task.
      */
     async closeSession() {
         if (!this._task) return;
 
-        // Save full state to Store with compressed msgs
-        const store = this._store || Store.instance;
-        if (store && this.context) {
-            const { chat_history, tool_digest } = await this.context.prepareForStorage();
-            const data = {
-                id: this.id,
-                name: this.name,
-                prompt: this.prompt,
-                userData: this.userData,
-                sessionConfig: this.sessionConfig,
-                tm_create: this.tm_create,
-                isolate: this._isolate,
-                taskId: this._task.id,
-                context_id: this.context_id,
-                context: {
-                    tag: this.context.tag,
-                    chat_history,
-                    tool_digest,
-                    functions: this.context.functions,
-                },
-            };
-            await store.save(this.id, data);
+        if (this._storeName && this.msgs) {
+            const backend = Saico.getBackend();
+            if (backend) {
+                const data = await this.prepareForStorage();
+                await backend.put(data, this._storeName);
+            }
         }
 
         this._task._ecancel();
@@ -541,7 +530,8 @@ class Saico {
             if (task._saico?._db) return task._saico._db;
             task = task.parent;
         }
-        throw new Error('No DB backend configured. Set opt.dynamodb or opt.db on this Saico or an ancestor.');
+        if (Saico._backend) return Saico._backend;
+        throw new Error('No DB backend configured. Call Saico.registerBackend() or set opt.db.');
     }
 
     async dbPutItem(item, table) {
@@ -629,41 +619,63 @@ class Saico {
     // ---- Serialization ----
 
     /**
-     * Serialize the Saico instance to a JSON string.
-     * Context messages are included as raw _msgs (for Redis / in-memory use).
-     * For durable storage with compressed msgs, use closeSession().
+     * Prepare this instance for storage. Creates a clean snapshot:
+     * - Strips all '_' prefixed properties
+     * - Strips functions (including states)
+     * - Builds compressed chat_history from msgs Q (via Msgs.prepareForStorage)
+     * - Adds taskId from internal Itask
+     * @returns {Promise<Object>} Plain serializable object
      */
-    serialize() {
-        const data = {
-            id: this.id,
-            name: this.name,
-            prompt: this.prompt,
-            userData: this.userData,
-            sessionConfig: this.sessionConfig,
-            tm_create: this.tm_create,
-            isolate: this._isolate,
-        };
-        data.taskId = this._task?.id || null;
-        data.context_id = this.context_id || null;
-        data.context = this.context ? {
-            tag: this.context.tag,
-            msgs: this.context._msgs,
-            functions: this.context.functions,
-            tool_digest: this.context.tool_digest,
-        } : null;
-        return JSON.stringify(data);
+    async prepareForStorage() {
+        const data = {};
+        for (const key of Object.keys(this)) {
+            if (key.startsWith('_')) continue;
+            if (typeof this[key] === 'function') continue;
+            if (key === 'msgs') continue;       // handled specially below
+            if (key === 'states') continue;      // function array, not serializable
+            data[key] = this[key];
+        }
+
+        // Deep clone to detach from live instance
+        const cloned = JSON.parse(JSON.stringify(data));
+
+        // Handle msgs — compress via Msgs.prepareForStorage
+        if (this.msgs) {
+            const { chat_history, tool_digest } = await this.msgs.prepareForStorage();
+            cloned.msgs = {
+                tag: this.msgs.tag,
+                chat_history,
+                tool_digest,
+                functions: this.msgs.functions,
+            };
+        } else {
+            cloned.msgs = null;
+        }
+
+        // Derived properties from underscore-prefixed internals
+        cloned.taskId = this._task?.id || null;
+
+        return cloned;
+    }
+
+    /**
+     * Serialize the Saico instance to a JSON string.
+     * Calls prepareForStorage() to build a clean snapshot, then JSON.stringify.
+     */
+    async serialize() {
+        const prepared = await this.prepareForStorage();
+        return JSON.stringify(prepared);
     }
 
     /**
      * Restore a Saico instance from serialized data.
-     * Supports both raw msgs (from serialize/Redis) and compressed
-     * chat_history (from closeSession/Store).
      * @param {string|Object} data - Serialized data (JSON string or object)
      * @param {Object} opt - Options (functions, store, states, etc.)
-     * @returns {Saico}
+     * @returns {Promise<Saico>}
      */
-    static deserialize(data, opt = {}) {
+    static async deserialize(data, opt = {}) {
         const parsed = typeof data === 'string' ? JSON.parse(data) : data;
+        const msgsData = parsed.msgs;
 
         const instance = new Saico({
             id: parsed.id,
@@ -672,7 +684,7 @@ class Saico {
             userData: parsed.userData,
             sessionConfig: parsed.sessionConfig,
             isolate: parsed.isolate,
-            functions: opt.functions || parsed.context?.functions,
+            functions: opt.functions || msgsData?.functions,
             store: opt.store,
             redis: false, // No Redis proxy during deserialization
         });
@@ -681,48 +693,67 @@ class Saico {
 
         // Activate with restored state if taskId exists
         if (parsed.taskId) {
-            const ctx = parsed.context;
             instance.activate({
-                createQ: !!ctx,
+                createQ: !!msgsData,
                 taskId: parsed.taskId,
-                tag: ctx?.tag,
-                chat_history: ctx?.chat_history,
-                functions: opt.functions || ctx?.functions,
-                tool_digest: ctx?.tool_digest,
+                tag: msgsData?.tag,
+                chat_history: msgsData?.chat_history,
+                functions: opt.functions || msgsData?.functions,
+                tool_digest: msgsData?.tool_digest,
                 states: opt.states || [],
                 ...opt,
             });
 
-            // Restore raw msgs (from serialize/Redis) — takes priority over chat_history
-            if (ctx?.msgs && instance.context) {
-                instance.context._msgs = ctx.msgs;
-            }
+            // Decompress chat_history into _msgs
+            if (instance.msgs)
+                await instance.msgs.initHistory();
         }
 
         return instance;
     }
 
     /**
-     * Load a Saico instance from Store by id.
+     * Load a Saico instance from the registered backend by id.
      * @param {string} id - The Saico instance id
-     * @param {Object} opt - Options (store, functions, states, etc.)
+     * @param {Object} opt - Options (store: table name, backend, functions, states, etc.)
      * @returns {Promise<Saico|null>}
      */
     static async rehydrate(id, opt = {}) {
-        const store = opt.store || Store.instance;
-        if (!store)
-            throw new Error('No store available for rehydrate');
-        const data = await store.load(id);
+        const backend = opt.backend || Saico.getBackend();
+        if (!backend)
+            throw new Error('No backend registered. Call Saico.registerBackend() first.');
+        const table = opt.store;
+        if (!table)
+            throw new Error('No table specified. Pass opt.store.');
+        const data = await backend.get('id', id, table);
         if (!data) return null;
-        const instance = Saico.deserialize(data, opt);
-        // Decompress chat_history into _msgs if present
-        if (instance.context)
-            await instance.context.initHistory();
-        return instance;
+        return Saico.deserialize(data, opt);
     }
 }
 
-// [BACKEND] explanation text appended to context prompts
+// ---- Static backend registration ----
+
+Saico._backend = null;
+
+/**
+ * Register a storage backend at library level (once, outside instance context).
+ * @param {string} type - Backend type ('dynamodb')
+ * @param {Object} config - Backend config (passed to adapter constructor)
+ */
+Saico.registerBackend = function(type, config) {
+    if (type === 'dynamodb') {
+        const { DynamoDBAdapter } = require('./dynamo.js');
+        Saico._backend = new DynamoDBAdapter(config);
+    } else {
+        throw new Error('Unknown backend type: ' + type);
+    }
+};
+
+Saico.getBackend = function() {
+    return Saico._backend;
+};
+
+// [BACKEND] explanation text appended to msgs Q prompts
 Saico.BACKEND_EXPLANATION = '\nNote: Messages prefixed with [BACKEND] are from the backend ' +
     'server, not the user. They contain server instructions, data updates, or system context. ' +
     'Treat them as authoritative system-level information.';

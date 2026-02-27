@@ -2,28 +2,30 @@
 
 const Itask = require('./itask.js');
 const { Msgs, createMsgs } = require('./msgs.js');
-const { Store, DynamoBackend } = require('./store.js');
+const { Store } = require('./store.js');
 const { Saico } = require('./saico.js');
 const { DynamoDBAdapter } = require('./dynamo.js');
 
 /**
  * Initialize Saico with storage configuration.
- * Sets up the Store singleton and optionally initializes Redis.
+ * Registers the backend and optionally initializes Redis.
  *
  * @param {Object} config - Configuration options
- * @param {boolean} config.redis - Whether to initialize Redis
- * @param {Object} config.dynamodb - DynamoDB backend config {table, aws}
+ * @param {boolean} [config.redis=true] - Set false to skip Redis init
+ * @param {Object} [config.dynamodb] - DynamoDB config { region, credentials, client }
  * @returns {Store} The initialized Store instance
  */
 async function init(config = {}) {
-    const store = Store.init(config);
-
-    if (config.redis) {
+    if (config.redis !== false) {
         const redis = require('./redis.js');
         await redis.init();
-        store.setRedis(redis.rclient);
     }
 
+    if (config.dynamodb)
+        Saico.registerBackend('dynamodb', config.dynamodb);
+
+    // Legacy: still init Store shell
+    const store = Store.init(config);
     return store;
 }
 
@@ -36,7 +38,6 @@ module.exports = {
     Itask,
     Msgs,
     Store,
-    DynamoBackend,
 
     // Initialization
     init,
