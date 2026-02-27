@@ -72,14 +72,14 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - `_getDb()` searches up parent Saico chain when no local `_db`; throws if none found
    - DB retrieval methods (`dbGetItem`, `dbQuery`, `dbGetAll`) call `_deserializeRecord()` hook
    - `opt.dynamodb = { region, credentials }` auto-creates DynamoDBAdapter; `opt.db` accepts any adapter
-   - Child spawning: `spawn(child)` and `spawnAndRun(child)` — both parent and child must be activated Saico instances
-   - Context methods: `setContext()`, `findContext()`, `findDeepestContext()`, `closeContext()`
+   - Child spawning: `spawn(child)` and `spawnAndRun(child)` — parent must be activated; child is auto-activated if needed
+   - Context methods: `setContext()`, `findContext()`, `findDeepestContext()`
    - Overridable `getStateSummary()` hook
    - `getRecentMessages(n)` — user/assistant messages (no tool calls, no BACKEND)
    - `_getStateSummary(activeCtx)` — includes recent messages when context is not the active Q
    - **deactivate**: bubbles cleaned messages to parent Q, then closes context
    - User data: `userData`, `setUserData()`, `getUserData()`, `clearUserData()`
-   - Session info: `getSessionInfo()`, `closeSession()`, `sessionConfig`
+   - Session info: `getSessionInfo()`, `closeSession()`, `static rehydrate()`, `sessionConfig`
    - Serialization: `serialize()`, `static Saico.deserialize()`
    - `Saico.BACKEND_EXPLANATION` — static text appended to context prompts
 
@@ -102,6 +102,8 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - `_createMsgQ(preamble, add_tag, tag_filter)` — when preamble is provided (by Saico), it is prepended as-is and does NOT count against QUEUE_LIMIT. Otherwise falls back to standalone behavior (own prompt + tool digest)
    - `_processSendMessage` uses `_preamble` and `_aggregatedFunctions` from opts when available
    - `getFunctions()` aggregates from ancestor contexts (standalone fallback)
+   - `prepareForStorage()` — filters/trims/compresses _msgs for durable persistence
+   - `initHistory()` — decompresses `_chat_history` into `_msgs` (called by `Saico.rehydrate`)
    - `context.js` shim has been removed; import directly from `msgs.js`
 
 5. **dynamo.js** - DynamoDB storage adapter (generalized from backend/aws.js)
@@ -136,7 +138,8 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
 - `new Saico(opt)` — creates instance with Redis proxy + DB access. No Itask yet. `opt.createQ` and `this.states` can be set here.
 - `instance.activate()` — creates internal Itask + optional message Q context (uses `this.createQ` and `this.states` from class)
 - `instance.deactivate()` — bubbles cleaned messages to parent, closes context, cancels task
-- `instance.closeSession()` — closes context and cancels task
+- `instance.closeSession()` — compresses msgs, saves full state to Store, cancels task
+- `Saico.rehydrate(id, { store })` — loads from Store, decompresses msgs, returns restored Saico
 - DB methods (`dbGetItem`, etc.) work before and after activation
 
 **Pluggable DB Backend**: The Saico class has generic DB methods that delegate to `_getDb()`:
@@ -148,7 +151,7 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
 
 **Task Hierarchy**: Parent-child relationship where:
 - Contexts are owned by Saico instances (not by Itask)
-- Child Saico instances are spawned via `parent.spawn(child)` (both must be activated)
+- Child Saico instances are spawned via `parent.spawn(child)` (parent must be activated; child auto-activated if needed)
 - `TOOL_` methods are discovered by searching the Saico hierarchy via `task._saico`
 - Child Saico instances inherit DB access from parents via `_getDb()` parent chain search
 - `findContext()` walks UP via `task._saico?.context` to find nearest context
@@ -303,32 +306,34 @@ session.getUserData('role');  // 'admin'
 // Session info
 session.getSessionInfo();  // { id, name, running, completed, messageCount, ... }
 
-// Close
+// Close — saves full state (compressed msgs) to Store, cancels task
 await session.closeSession();
+
+// Rehydrate — restore from Store
+const restored = await Saico.rehydrate(session._id, { store });
 ```
 
 **Spawning Child Saico Instances**:
 ```javascript
-// Child with its own context
+// Child with its own context (auto-activated by spawn)
 const child = new Saico({
     name: 'subtask',
     prompt: 'Handling a specific sub-task',
+    createQ: true,
 });
-child.activate({ createQ: true });
-session.spawn(child);  // attaches child under parent's task hierarchy
+session.spawn(child);  // auto-activates child, attaches under parent
 
 // Send message from child (preamble aggregated from parent chain)
 await child.sendMessage('Working...');
 
 // Child without context (uses parent's context via findContext())
 const simple = new Saico({ name: 'simple' });
-simple.activate();
 session.spawn(simple);
 await simple.sendMessage('Quick operation');  // finds parent's context
 
 // spawnAndRun: spawn + schedule child._task._run() on nextTick
 const runner = new Saico({ name: 'runner' });
-runner.activate({ states: [async function() { return await this.sendMessage('Go'); }] });
+runner.states = [async function() { return await this.sendMessage('Go'); }];
 session.spawnAndRun(runner);
 ```
 
@@ -337,19 +342,21 @@ session.spawnAndRun(runner);
 const isolated = new Saico({
     name: 'isolated-agent',
     prompt: 'Independent agent prompt',
+    createQ: true,
     isolate: true,  // parent prompts/tools/digests not included
 });
-isolated.activate({ createQ: true });
 parentSaico.spawn(isolated);
 ```
 
-**Serialization**:
+**Serialization / Persistence**:
 ```javascript
-// Save session
+// In-memory snapshot (raw msgs, used by Redis proxy)
 const serialized = session.serialize();
-
-// Restore session
 const restored = Saico.deserialize(serialized);
+
+// Durable persistence (compressed msgs, saved to Store)
+await session.closeSession();  // saves to Store under session._id
+const restored2 = await Saico.rehydrate(id, { store });
 ```
 
 **DB deserialization hook**:
@@ -403,10 +410,10 @@ Search order: current Saico → walk UP parents → walk DOWN children (BFS). Fi
 ### Testing Framework
 
 Uses Mocha with Chai and Sinon for:
-- Saico class lifecycle, context ownership, spawn/spawnAndRun, DB delegation, subclass extension, Redis proxy, sendMessage orchestration, recvChatMessage routing, preamble building, opt.isolate, deactivate bubbling, userData, sessionConfig, serialize/deserialize, DB deserialize hook, closeSession, getSessionInfo (saico.test.js)
+- Saico class lifecycle, context ownership, spawn/spawnAndRun, DB delegation, subclass extension, Redis proxy, sendMessage orchestration, recvChatMessage routing, preamble building, opt.isolate, deactivate bubbling, userData, sessionConfig, serialize/deserialize, closeSession/rehydrate, DB deserialize hook, getSessionInfo (saico.test.js)
 - DynamoDB adapter with mocked client (dynamo.test.js)
 - Pure task hierarchy, states, cancellation, wait/continue (itask.test.js)
-- Message handling, tool calls, _createMsgQ with preamble support (context.test.js)
+- Message handling, tool calls, _createMsgQ with preamble support, prepareForStorage, initHistory (context.test.js)
 - Full hierarchy message flow, tool calls, serialization (integration.test.js)
 
 Test files mock external dependencies (OpenAI API, token counting, DynamoDB client) for isolated unit testing. DB adapter tests inject a mock client via `opt.client`.

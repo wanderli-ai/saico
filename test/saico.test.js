@@ -331,11 +331,14 @@ describe('Saico', function () {
             expect(() => parent.spawn(child)).to.throw('Not activated');
         });
 
-        it('should throw when child is not activated', () => {
-            const parent = new Saico();
+        it('should auto-activate child if not activated', () => {
+            const parent = new Saico({ name: 'parent' });
             parent.activate();
-            const child = new Saico();
-            expect(() => parent.spawn(child)).to.throw('Child must be an activated Saico instance');
+            const child = new Saico({ name: 'child', createQ: true });
+            parent.spawn(child);
+            expect(child._task).to.exist;
+            expect(child._task.parent).to.equal(parent._task);
+            expect(child.context).to.exist;
         });
 
         it('should spawn child under parent task', () => {
@@ -789,19 +792,98 @@ describe('Saico', function () {
     });
 
     describe('closeSession', () => {
-        it('should close context and cancel task', async () => {
+        it('should cancel task', async () => {
             const s = new Saico({ name: 'test' });
             s.activate({ createQ: true });
             const task = s._task;
             await s.closeSession();
-            // _ecancel is async (uses setImmediate for idle tasks), wait a tick
             await new Promise(resolve => setImmediate(resolve));
             expect(task._completed).to.be.true;
+        });
+
+        it('should save full state to Store with compressed msgs', async () => {
+            const mockStore = { save: sandbox.stub().resolves(), load: sandbox.stub(), generateId: () => require('crypto').randomBytes(8).toString('hex') };
+            const s = new Saico({ id: 'test-id', name: 'test', prompt: 'p' });
+            s._store = mockStore;
+            s.activate({ createQ: true });
+            s.context.push({ role: 'user', content: 'Hello' });
+            s.context.push({ role: 'assistant', content: 'Hi there' });
+
+            await s.closeSession();
+
+            expect(mockStore.save.calledOnce).to.be.true;
+            const [key, data] = mockStore.save.firstCall.args;
+            expect(key).to.equal('test-id');
+            expect(data.id).to.equal('test-id');
+            expect(data.name).to.equal('test');
+            expect(data.context).to.be.an('object');
+            expect(data.context.chat_history).to.be.a('string'); // compressed
+            expect(data.context.tool_digest).to.be.an('array');
+            expect(data.context.msgs).to.be.undefined; // no raw msgs in store
         });
 
         it('should be safe to call when not activated', async () => {
             const s = new Saico();
             await s.closeSession(); // should not throw
+        });
+    });
+
+    describe('static rehydrate', () => {
+        it('should restore from Store with compressed msgs', async () => {
+            // Create and close a session
+            const original = new Saico({ id: 'rh-id', name: 'rh-test', prompt: 'p' });
+            original.activate({ createQ: true });
+            original.context.push({ role: 'user', content: 'Hello' });
+            original.context.push({ role: 'assistant', content: 'Hi' });
+
+            const { chat_history, tool_digest } = await original.context.prepareForStorage();
+            const storeData = {
+                id: 'rh-id',
+                name: 'rh-test',
+                prompt: 'p',
+                userData: {},
+                sessionConfig: original.sessionConfig,
+                tm_create: original.tm_create,
+                isolate: false,
+                taskId: original._task.id,
+                context_id: original.context_id,
+                context: {
+                    tag: original.context.tag,
+                    chat_history,
+                    tool_digest,
+                    functions: null,
+                },
+            };
+
+            const mockStore = {
+                save: sandbox.stub().resolves(),
+                load: sandbox.stub().resolves(storeData),
+                generateId: () => require('crypto').randomBytes(8).toString('hex'),
+            };
+
+            const restored = await Saico.rehydrate('rh-id', { store: mockStore });
+
+            expect(restored).to.be.instanceOf(Saico);
+            expect(restored._id).to.equal('rh-id');
+            expect(restored.context).to.be.instanceOf(Context);
+            expect(restored.context._msgs).to.have.length(2);
+            expect(restored.context._msgs[0].msg.content).to.equal('Hello');
+            expect(restored.context._msgs[1].msg.content).to.equal('Hi');
+        });
+
+        it('should return null when not found in Store', async () => {
+            const mockStore = { load: sandbox.stub().resolves(null) };
+            const result = await Saico.rehydrate('missing', { store: mockStore });
+            expect(result).to.be.null;
+        });
+
+        it('should throw when no store available', async () => {
+            try {
+                await Saico.rehydrate('id');
+                expect.fail('should have thrown');
+            } catch (e) {
+                expect(e.message).to.include('No store');
+            }
         });
     });
 
@@ -890,7 +972,9 @@ describe('Saico', function () {
             expect(data.id).to.equal('test-id');
             expect(data.name).to.equal('test');
             expect(data.prompt).to.equal('p');
-            expect(data.task).to.be.undefined;
+            expect(data.taskId).to.be.null;
+            expect(data.context).to.be.null;
+            expect(data.context_id).to.be.null;
             expect(data.userData).to.deep.equal({});
             expect(data.sessionConfig).to.be.an('object');
             expect(data.tm_create).to.be.a('number');
@@ -900,12 +984,15 @@ describe('Saico', function () {
         it('should serialize with activated task', () => {
             const s = new Saico({ id: 'test-id', name: 'test', prompt: 'p' });
             s.activate({ createQ: true });
+            s.context.push({ role: 'user', content: 'Hello' });
             const json = s.serialize();
             const data = JSON.parse(json);
-            expect(data.task).to.be.an('object');
-            expect(data.task.context_id).to.be.a('string');
-            expect(data.task.context).to.be.an('object');
-            expect(data.task.context.tag).to.be.a('string');
+            expect(data.taskId).to.be.a('string');
+            expect(data.context_id).to.be.a('string');
+            expect(data.context).to.be.an('object');
+            expect(data.context.tag).to.be.a('string');
+            expect(data.context.msgs).to.be.an('array');
+            expect(data.context.msgs).to.have.length(1);
         });
 
         it('should serialize activated task without context', () => {
@@ -913,8 +1000,8 @@ describe('Saico', function () {
             s.activate();
             const json = s.serialize();
             const data = JSON.parse(json);
-            expect(data.task).to.be.an('object');
-            expect(data.task.context).to.be.null;
+            expect(data.taskId).to.be.a('string');
+            expect(data.context).to.be.null;
         });
 
         it('should include userData and sessionConfig', () => {

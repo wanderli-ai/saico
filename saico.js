@@ -152,6 +152,7 @@ class Saico {
                 sequential_mode: opts.sequential_mode,
                 msgs: opts.msgs,
                 chat_history: opts.chat_history,
+                tool_digest: opts.tool_digest,
                 ...opts.contextConfig,
             };
 
@@ -224,51 +225,6 @@ class Saico {
     }
 
     /**
-     * Close this Saico's context and bubble summary to parent.
-     */
-    async closeContext() {
-        if (!this.context)
-            return;
-
-        // Clean tool call messages tagged with this context_id
-        if (this.context_id && typeof this.context.cleanToolCallsByTag === 'function')
-            this.context.cleanToolCallsByTag(this.context_id);
-
-        // Filter out tool calls and [BACKEND] messages, compress remaining as chat_history
-        const cleanedMsgs = this.context._msgs.filter(m => {
-            if (m.msg.tool_calls) return false;
-            if (m.msg.role === 'tool') return false;
-            if (typeof m.msg.content === 'string' && m.msg.content.startsWith('[BACKEND]')) return false;
-            return true;
-        }).map(m => m.msg);
-
-        // Trim to last QUEUE_LIMIT before persisting
-        const queueLimit = this.context.QUEUE_LIMIT || 30;
-        const trimmedMsgs = cleanedMsgs.length > queueLimit
-            ? cleanedMsgs.slice(-queueLimit)
-            : cleanedMsgs;
-
-        if (trimmedMsgs.length > 0) {
-            const chat_history = await util.compressMessages(trimmedMsgs);
-            this.context.chat_history = chat_history;
-
-            // Persist to store
-            const store = this._store || Store.instance;
-            if (store && this.context_id) {
-                await store.save(this.context_id, {
-                    chat_history,
-                    tool_digest: this.context.tool_digest || [],
-                    prompt: this.context.prompt,
-                    tag: this.context.tag,
-                    tm_closed: Date.now()
-                });
-            }
-        }
-
-        await this.context.close();
-    }
-
-    /**
      * Deactivate — bubble cleaned messages to parent, close context, cancel task.
      * Pushes cleaned messages (no tool calls, no BACKEND) into the parent's Q,
      * then closes the context without the default summary bubbling.
@@ -309,15 +265,16 @@ class Saico {
     spawn(child) {
         if (!this._task)
             throw new Error('Not activated. Call activate() first.');
-        if (!(child instanceof Saico) || !child._task)
-            throw new Error('Child must be an activated Saico instance.');
+        if (!(child instanceof Saico))
+            throw new Error('Child must be a Saico instance.');
+        if (!child._task) child.activate();
         this._task.spawn(child._task);
         return child;
     }
 
     /**
      * Spawn a child Saico and start its task running.
-     * @param {Saico} child - An activated Saico instance
+     * @param {Saico} child - A Saico instance (auto-activated if needed)
      * @returns {Saico} the child (for chaining)
      */
     spawnAndRun(child) {
@@ -518,10 +475,38 @@ class Saico {
         };
     }
 
+    /**
+     * Close the session — compress msgs, save full state to Store, cancel task.
+     * The saved object has the same shape as serialize() but with compressed
+     * context messages (chat_history) instead of raw _msgs.
+     */
     async closeSession() {
         if (!this._task) return;
-        if (this.context)
-            await this.context.close();
+
+        // Save full state to Store with compressed msgs
+        const store = this._store || Store.instance;
+        if (store && this.context) {
+            const { chat_history, tool_digest } = await this.context.prepareForStorage();
+            const data = {
+                id: this._id,
+                name: this.name,
+                prompt: this.prompt,
+                userData: this.userData,
+                sessionConfig: this.sessionConfig,
+                tm_create: this.tm_create,
+                isolate: this._isolate,
+                taskId: this._task.id,
+                context_id: this.context_id,
+                context: {
+                    tag: this.context.tag,
+                    chat_history,
+                    tool_digest,
+                    functions: this.context.functions,
+                },
+            };
+            await store.save(this._id, data);
+        }
+
         this._task._ecancel();
     }
 
@@ -625,6 +610,11 @@ class Saico {
 
     // ---- Serialization ----
 
+    /**
+     * Serialize the Saico instance to a JSON string.
+     * Context messages are included as raw _msgs (for Redis / in-memory use).
+     * For durable storage with compressed msgs, use closeSession().
+     */
     serialize() {
         const data = {
             id: this._id,
@@ -635,24 +625,21 @@ class Saico {
             tm_create: this.tm_create,
             isolate: this._isolate,
         };
-        if (this._task) {
-            data.task = {
-                id: this._task.id,
-                context_id: this.context_id,
-                context: this.context ? {
-                    tag: this.context.tag,
-                    msgs: this.context._msgs,
-                    functions: this.context.functions,
-                    chat_history: this.context.chat_history,
-                    tool_digest: this.context.tool_digest,
-                } : null,
-            };
-        }
+        data.taskId = this._task?.id || null;
+        data.context_id = this.context_id || null;
+        data.context = this.context ? {
+            tag: this.context.tag,
+            msgs: this.context._msgs,
+            functions: this.context.functions,
+            tool_digest: this.context.tool_digest,
+        } : null;
         return JSON.stringify(data);
     }
 
     /**
      * Restore a Saico instance from serialized data.
+     * Supports both raw msgs (from serialize/Redis) and compressed
+     * chat_history (from closeSession/Store).
      * @param {string|Object} data - Serialized data (JSON string or object)
      * @param {Object} opt - Options (functions, store, states, etc.)
      * @returns {Saico}
@@ -667,36 +654,52 @@ class Saico {
             userData: parsed.userData,
             sessionConfig: parsed.sessionConfig,
             isolate: parsed.isolate,
-            functions: opt.functions || parsed.task?.context?.functions,
+            functions: opt.functions || parsed.context?.functions,
             store: opt.store,
             redis: false, // No Redis proxy during deserialization
         });
 
         instance.tm_create = parsed.tm_create || instance.tm_create;
 
-        // Activate with restored context if task data exists
-        if (parsed.task) {
+        // Activate with restored state if taskId exists
+        if (parsed.taskId) {
+            const ctx = parsed.context;
             instance.activate({
-                createQ: !!parsed.task.context,
-                taskId: parsed.task.id,
-                tag: parsed.task.context?.tag,
-                chat_history: parsed.task.context?.chat_history,
-                functions: opt.functions || parsed.task.context?.functions,
+                createQ: !!ctx,
+                taskId: parsed.taskId,
+                tag: ctx?.tag,
+                chat_history: ctx?.chat_history,
+                functions: opt.functions || ctx?.functions,
+                tool_digest: ctx?.tool_digest,
                 states: opt.states || [],
                 ...opt,
             });
 
-            // Restore messages to context
-            if (parsed.task.context?.msgs && instance.context) {
-                instance.context._msgs = parsed.task.context.msgs;
-            }
-
-            // Restore tool_digest
-            if (Array.isArray(parsed.task.context?.tool_digest) && instance.context) {
-                instance.context.tool_digest = parsed.task.context.tool_digest;
+            // Restore raw msgs (from serialize/Redis) — takes priority over chat_history
+            if (ctx?.msgs && instance.context) {
+                instance.context._msgs = ctx.msgs;
             }
         }
 
+        return instance;
+    }
+
+    /**
+     * Load a Saico instance from Store by id.
+     * @param {string} id - The Saico instance id
+     * @param {Object} opt - Options (store, functions, states, etc.)
+     * @returns {Promise<Saico|null>}
+     */
+    static async rehydrate(id, opt = {}) {
+        const store = opt.store || Store.instance;
+        if (!store)
+            throw new Error('No store available for rehydrate');
+        const data = await store.load(id);
+        if (!data) return null;
+        const instance = Saico.deserialize(data, opt);
+        // Decompress chat_history into _msgs if present
+        if (instance.context)
+            await instance.context.initHistory();
         return instance;
     }
 }

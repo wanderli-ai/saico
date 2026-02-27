@@ -156,29 +156,28 @@ When a Saico's context is not the deepest active one, its last 5 user/assistant 
 ### Spawning Child Saico Instances
 
 ```js
-// Child with its own conversation context
+// Child with its own conversation context (auto-activated by spawn)
 const child = new Saico({
     name: 'subtask',
     prompt: 'Handle this specific sub-task',
+    createQ: true,
     functions: [/* child-specific tools */],
 });
-child.activate({ createQ: true });
 agent.spawn(child);
 await child.sendMessage('Working on subtask...');
 
 // Child without context (uses parent's via findContext())
 const simple = new Saico({ name: 'simple' });
-simple.activate();
 agent.spawn(simple);
 await simple.sendMessage('Quick operation');
 
 // spawnAndRun: spawn + schedule child task to run on nextTick
 const runner = new Saico({ name: 'runner' });
-runner.activate({ states: [async function() { return await this.sendMessage('Go'); }] });
+runner.states = [async function() { return await this.sendMessage('Go'); }];
 agent.spawnAndRun(runner);
 ```
 
-Both parent and child must be activated before calling `spawn()` or `spawnAndRun()`.
+Parent must be activated before calling `spawn()` or `spawnAndRun()`. Children are auto-activated if needed.
 
 ### Deactivation and Message Bubbling
 
@@ -258,7 +257,10 @@ agent.getSessionInfo();
 //   userData, uptime
 // }
 
-await agent.closeSession();  // Close context and cancel task
+await agent.closeSession();  // Saves full state to Store, cancels task
+
+// Restore from Store
+const restored = await Saico.rehydrate(agent._id, { store });
 ```
 
 ## Database Access
@@ -299,16 +301,16 @@ class MyAgent extends Saico {
 ## Serialization
 
 ```js
-// Save
+// In-memory snapshot (raw msgs, used by Redis proxy)
 const json = agent.serialize();
+const restored = Saico.deserialize(json);
 
-// Restore
-const restored = Saico.deserialize(json, {
-    functions: myFunctions,
-});
+// Durable persistence (compressed msgs, saved to Store)
+await agent.closeSession();
+const restored2 = await Saico.rehydrate(agent._id, { store });
 ```
 
-Serialization includes: id, name, prompt, userData, sessionConfig, tm_create, isolate, and full context state (messages, tool_digest, chat_history).
+`serialize()` includes: id, name, prompt, userData, sessionConfig, tm_create, isolate, and full context state (raw messages, tool_digest). `closeSession()` saves the same shape but with compressed messages for durable storage.
 
 ## Redis Persistence
 
@@ -388,7 +390,7 @@ saico/
 npm test
 ```
 
-284 tests covering Saico lifecycle, context ownership, spawn/spawnAndRun, task hierarchy, message handling, tool calls, DB adapters, serialization, and integration flows.
+296 tests covering Saico lifecycle, context ownership, spawn/spawnAndRun, task hierarchy, message handling, tool calls, DB adapters, serialization, persistence (closeSession/rehydrate), and integration flows.
 
 ## Requirements
 

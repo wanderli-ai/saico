@@ -489,12 +489,12 @@ describe('Context', function () {
     describe('chat_history', () => {
         it('should accept chat_history in config', () => {
             const ctx = new Context(fakePrompt, null, { chat_history: 'some-data' });
-            expect(ctx.chat_history).to.equal('some-data');
+            expect(ctx._chat_history).to.equal('some-data');
         });
 
         it('should default chat_history to null', () => {
             const ctx = new Context(fakePrompt, null, {});
-            expect(ctx.chat_history).to.be.null;
+            expect(ctx._chat_history).to.be.null;
         });
     });
 
@@ -531,19 +531,14 @@ describe('Context', function () {
         });
     });
 
-    describe('loadHistory', () => {
-        it('should load and insert history messages', async () => {
-            const ctx = new Context(fakePrompt, null, { tag: 'test-tag' });
-            const mockStore = {
-                load: sandbox.stub().resolves({
-                    chat_history: JSON.stringify([
-                        { role: 'user', content: 'Old message' },
-                        { role: 'assistant', content: 'Old reply' }
-                    ])
-                })
-            };
-
-            await ctx.loadHistory(mockStore);
+    describe('initHistory', () => {
+        it('should decompress chat_history into _msgs', async () => {
+            const compressed = await util.compressMessages([
+                { role: 'user', content: 'Old message' },
+                { role: 'assistant', content: 'Old reply' }
+            ]);
+            const ctx = new Context(fakePrompt, null, { chat_history: compressed });
+            await ctx.initHistory();
 
             expect(ctx._msgs).to.have.length(2);
             expect(ctx._msgs[0].msg.content).to.equal('Old message');
@@ -551,43 +546,88 @@ describe('Context', function () {
             expect(ctx._msgs[0].replied).to.equal(1);
         });
 
-        it('should insert after system messages', async () => {
-            const ctx = new Context(fakePrompt, null, { tag: 'test-tag' });
+        it('should accept plain JSON chat_history', async () => {
+            const json = JSON.stringify([
+                { role: 'user', content: 'Plain msg' }
+            ]);
+            const ctx = new Context(fakePrompt, null, { chat_history: json });
+            await ctx.initHistory();
 
-            // Add a system message first
-            ctx._msgs.push({
-                msg: { role: 'system', content: 'System instruction' },
-                opts: {},
-                msgid: 'sys1',
-                replied: 1
-            });
-
-            const mockStore = {
-                load: sandbox.stub().resolves({
-                    chat_history: JSON.stringify([
-                        { role: 'user', content: 'History msg' }
-                    ])
-                })
-            };
-
-            await ctx.loadHistory(mockStore);
-
-            expect(ctx._msgs).to.have.length(2);
-            expect(ctx._msgs[0].msg.role).to.equal('system');
-            expect(ctx._msgs[1].msg.content).to.equal('History msg');
+            expect(ctx._msgs).to.have.length(1);
+            expect(ctx._msgs[0].msg.content).to.equal('Plain msg');
         });
 
-        it('should handle missing store gracefully', async () => {
+        it('should no-op when no chat_history', async () => {
             const ctx = new Context(fakePrompt, null, {});
-            await ctx.loadHistory(null); // Should not throw
+            await ctx.initHistory();
             expect(ctx._msgs).to.have.length(0);
         });
 
-        it('should handle missing data gracefully', async () => {
-            const ctx = new Context(fakePrompt, null, { tag: 'test-tag' });
-            const mockStore = { load: sandbox.stub().resolves(null) };
-            await ctx.loadHistory(mockStore);
-            expect(ctx._msgs).to.have.length(0);
+        it('should no-op when _msgs already populated', async () => {
+            const compressed = await util.compressMessages([
+                { role: 'user', content: 'Should not appear' }
+            ]);
+            const ctx = new Context(fakePrompt, null, {
+                chat_history: compressed,
+                msgs: [{ role: 'user', content: 'Existing msg' }],
+            });
+            await ctx.initHistory();
+
+            expect(ctx._msgs).to.have.length(1);
+            expect(ctx._msgs[0].msg.content).to.equal('Existing msg');
+        });
+    });
+
+    describe('prepareForStorage', () => {
+        it('should filter and compress messages', async () => {
+            const ctx = new Context(fakePrompt, null, {});
+            ctx._msgs.push(
+                { msg: { role: 'user', content: 'Hello' }, opts: {}, msgid: '1', replied: 1 },
+                { msg: { role: 'assistant', content: 'Hi', tool_calls: [{}] }, opts: {}, msgid: '2', replied: 3 },
+                { msg: { role: 'tool', content: 'result' }, opts: {}, msgid: '3', replied: 1 },
+                { msg: { role: 'user', content: '[BACKEND] instruction' }, opts: {}, msgid: '4', replied: 1 },
+                { msg: { role: 'assistant', content: 'Reply' }, opts: {}, msgid: '5', replied: 3 },
+            );
+
+            const { chat_history, tool_digest } = await ctx.prepareForStorage();
+
+            expect(chat_history).to.be.a('string');
+            const restored = await util.decompressMessages(chat_history);
+            expect(restored).to.have.length(2);
+            expect(restored[0].content).to.equal('Hello');
+            expect(restored[1].content).to.equal('Reply');
+            expect(tool_digest).to.deep.equal([]);
+        });
+
+        it('should trim to QUEUE_LIMIT', async () => {
+            const ctx = new Context(fakePrompt, null, { queue_limit: 3 });
+            for (let i = 0; i < 10; i++) {
+                ctx._msgs.push({
+                    msg: { role: 'user', content: `msg${i}` },
+                    opts: {}, msgid: `m${i}`, replied: 1,
+                });
+            }
+
+            const { chat_history } = await ctx.prepareForStorage();
+            const restored = await util.decompressMessages(chat_history);
+            expect(restored).to.have.length(3);
+            expect(restored[0].content).to.equal('msg7');
+        });
+
+        it('should return null chat_history when no messages', async () => {
+            const ctx = new Context(fakePrompt, null, {});
+            const { chat_history } = await ctx.prepareForStorage();
+            expect(chat_history).to.be.null;
+        });
+
+        it('should include tool_digest', async () => {
+            const ctx = new Context(fakePrompt, null, {});
+            ctx.tool_digest = [{ tool: 'myTool', result: 'r', tm: 1 }];
+            ctx._msgs.push({ msg: { role: 'user', content: 'x' }, opts: {}, msgid: '1', replied: 1 });
+
+            const { tool_digest } = await ctx.prepareForStorage();
+            expect(tool_digest).to.have.length(1);
+            expect(tool_digest[0].tool).to.equal('myTool');
         });
     });
 
@@ -800,41 +840,16 @@ describe('Context', function () {
         });
     });
 
-    describe('loadHistory with tool_digest', () => {
-        it('should restore tool_digest from store data', async () => {
-            const ctx = new Context(fakePrompt, null, { tag: 'test-tag' });
-            const mockDigest = [{ tool: 'myTool', result: 'result', tm: Date.now() }];
-            const mockStore = {
-                load: sandbox.stub().resolves({
-                    chat_history: JSON.stringify([]),
-                    tool_digest: mockDigest
-                })
-            };
-            await ctx.loadHistory(mockStore);
-            expect(ctx.tool_digest).to.deep.equal(mockDigest);
+    describe('constructor with tool_digest', () => {
+        it('should accept tool_digest in config', () => {
+            const digest = [{ tool: 'myTool', result: 'result', tm: Date.now() }];
+            const ctx = new Context(fakePrompt, null, { tool_digest: digest });
+            expect(ctx.tool_digest).to.deep.equal(digest);
         });
 
-        it('should skip tool_digest restore when not an array', async () => {
-            const ctx = new Context(fakePrompt, null, { tag: 'test-tag' });
-            const mockStore = {
-                load: sandbox.stub().resolves({
-                    chat_history: JSON.stringify([]),
-                    tool_digest: null
-                })
-            };
-            await ctx.loadHistory(mockStore);
+        it('should default tool_digest to empty array', () => {
+            const ctx = new Context(fakePrompt, null, {});
             expect(ctx.tool_digest).to.deep.equal([]);
-        });
-
-        it('should handle store returning only tool_digest without chat_history', async () => {
-            const ctx = new Context(fakePrompt, null, { tag: 'test-tag' });
-            const mockDigest = [{ tool: 'tool1', result: 'r1', tm: Date.now() }];
-            const mockStore = {
-                load: sandbox.stub().resolves({ tool_digest: mockDigest })
-            };
-            await ctx.loadHistory(mockStore);
-            expect(ctx.tool_digest).to.deep.equal(mockDigest);
-            expect(ctx._msgs).to.have.length(0);
         });
     });
 

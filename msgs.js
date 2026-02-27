@@ -33,9 +33,6 @@ class Context {
         this._deferred_tool_calls = [];
         this._tool_call_sequence = [];
 
-        // Chat history persistence
-        this.chat_history = config.chat_history || null;
-
         this._msgs = [];
         this._waitingQueue = [];
         this._active_tool_calls = new Map();
@@ -53,7 +50,8 @@ class Context {
         // Tool digest — persistent history of tool calls that mutated task state
         this.tool_digest = config.tool_digest || [];
 
-        // Initialize messages if provided
+        // Initialize messages: explicit msgs take priority over chat_history
+        this._chat_history = config.chat_history || null;
         (config.msgs || []).forEach(m => this.push(m));
 
         _log('created Context for tag', this.tag);
@@ -64,6 +62,51 @@ class Context {
         this.task = task;
         if (!this.functions)
             this.functions = task?.functions;
+    }
+
+    /**
+     * Decompress _chat_history into _msgs. Call after construction when
+     * restoring from persisted state. No-op if chat_history is absent or
+     * _msgs were already provided via config.msgs.
+     */
+    async initHistory() {
+        if (!this._chat_history || this._msgs.length > 0)
+            return;
+        const messages = await util.decompressMessages(this._chat_history);
+        if (!Array.isArray(messages) || messages.length === 0)
+            return;
+        for (const m of messages) {
+            this._msgs.push({
+                msg: m,
+                opts: {},
+                msgid: crypto.randomBytes(2).toString('hex'),
+                replied: 1,
+            });
+        }
+    }
+
+    /**
+     * Prepare the message Q for storage. Filters out tool calls, tool
+     * responses, and [BACKEND] messages, trims to QUEUE_LIMIT, compresses.
+     * Returns { chat_history, tool_digest }. Does NOT mutate _msgs.
+     */
+    async prepareForStorage() {
+        const cleaned = this._msgs.filter(m => {
+            if (m.msg.tool_calls) return false;
+            if (m.msg.role === 'tool') return false;
+            if (typeof m.msg.content === 'string' && m.msg.content.startsWith('[BACKEND]')) return false;
+            return true;
+        }).map(m => m.msg);
+
+        const trimmed = cleaned.length > this.QUEUE_LIMIT
+            ? cleaned.slice(-this.QUEUE_LIMIT)
+            : cleaned;
+
+        const chat_history = trimmed.length > 0
+            ? await util.compressMessages(trimmed)
+            : null;
+
+        return { chat_history, tool_digest: this.tool_digest || [] };
     }
 
     // Snapshot all public (non-underscore) task properties for dirty detection.
@@ -447,34 +490,6 @@ class Context {
         _log('Finished closing Context tag', this.tag);
     }
 
-    // Load chat history from store into message queue
-    async loadHistory(store) {
-        if (!store || !this.tag)
-            return;
-        const data = await store.load(this.tag);
-        if (!data)
-            return;
-        if (Array.isArray(data.tool_digest))
-            this.tool_digest = data.tool_digest;
-        if (!data.chat_history)
-            return;
-        const messages = await util.decompressMessages(data.chat_history);
-        if (!Array.isArray(messages) || messages.length === 0)
-            return;
-        // Find the index after the last system message to insert history
-        let insertIdx = 0;
-        for (let i = 0; i < this._msgs.length; i++) {
-            if (this._msgs[i].msg.role === 'system')
-                insertIdx = i + 1;
-        }
-        const historyMsgs = messages.map(m => ({
-            msg: m,
-            opts: {},
-            msgid: crypto.randomBytes(2).toString('hex'),
-            replied: 1
-        }));
-        this._msgs.splice(insertIdx, 0, ...historyMsgs);
-    }
 
     // Remove tool-related messages tagged with a specific tag
     cleanToolCallsByTag(tag) {

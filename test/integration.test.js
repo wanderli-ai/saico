@@ -518,42 +518,32 @@ describe('Integration Tests', function () {
         });
     });
 
-    describe('Context loadHistory', () => {
-        it('should load and insert chat history after system messages', async () => {
-            const mockStore = {
-                load: sinon.stub().resolves({
-                    chat_history: JSON.stringify([
-                        { role: 'user', content: 'Previous question' },
-                        { role: 'assistant', content: 'Previous answer' }
-                    ])
-                })
-            };
+    describe('Context initHistory', () => {
+        it('should decompress chat_history into _msgs', async () => {
+            const compressed = await util.compressMessages([
+                { role: 'user', content: 'Previous question' },
+                { role: 'assistant', content: 'Previous answer' }
+            ]);
 
-            const ctx = createContext('System prompt', null, { tag: 'test-tag' });
-
-            await ctx.loadHistory(mockStore);
+            const ctx = createContext('System prompt', null, { tag: 'test-tag', chat_history: compressed });
+            await ctx.initHistory();
 
             expect(ctx._msgs).to.have.length(2);
             expect(ctx._msgs[0].msg.content).to.equal('Previous question');
             expect(ctx._msgs[1].msg.content).to.equal('Previous answer');
         });
 
-        it('should handle compressed chat history', async () => {
-            const messages = [
-                { role: 'user', content: 'Compressed question' },
-                { role: 'assistant', content: 'Compressed answer' }
-            ];
-            const compressed = await util.compressMessages(messages);
+        it('should accept plain JSON chat_history', async () => {
+            const json = JSON.stringify([
+                { role: 'user', content: 'Plain question' },
+                { role: 'assistant', content: 'Plain answer' }
+            ]);
 
-            const mockStore = {
-                load: sinon.stub().resolves({ chat_history: compressed })
-            };
-
-            const ctx = createContext('System prompt', null, { tag: 'test-tag' });
-            await ctx.loadHistory(mockStore);
+            const ctx = createContext('System prompt', null, { tag: 'test-tag', chat_history: json });
+            await ctx.initHistory();
 
             expect(ctx._msgs).to.have.length(2);
-            expect(ctx._msgs[0].msg.content).to.equal('Compressed question');
+            expect(ctx._msgs[0].msg.content).to.equal('Plain question');
         });
     });
 
@@ -663,11 +653,20 @@ describe('Integration Tests', function () {
     });
 
     describe('Full Persistence Flow', () => {
-        it('should create session, send messages, close, and verify chat_history', async () => {
+        it('should create session, send messages, close, and rehydrate', async () => {
+            const saved = {};
+            const mockStore = {
+                save: sinon.stub().callsFake((id, data) => { saved[id] = data; }),
+                load: sinon.stub().callsFake((id) => saved[id] || null),
+                generateId: () => require('crypto').randomBytes(8).toString('hex'),
+            };
+
             const session = new Saico({
+                id: 'persist-id',
                 name: 'persist-session',
                 prompt: 'Session prompt',
             });
+            session._store = mockStore;
             session.activate({ createQ: true });
 
             // Send backend message
@@ -684,6 +683,31 @@ describe('Integration Tests', function () {
             const chatMsg = session.context._msgs.find(m =>
                 m.msg.content === 'I want to book a hotel');
             expect(chatMsg).to.exist;
+
+            // Close — saves compressed state to store
+            await session.closeSession();
+
+            expect(mockStore.save.calledOnce).to.be.true;
+            const [key, data] = mockStore.save.firstCall.args;
+            expect(key).to.equal('persist-id');
+            expect(data.context.chat_history).to.be.a('string');
+            expect(data.context.msgs).to.be.undefined;
+
+            // Rehydrate — restore from store
+            const restored = await Saico.rehydrate('persist-id', { store: mockStore });
+            expect(restored._id).to.equal('persist-id');
+            expect(restored.name).to.equal('persist-session');
+            expect(restored.context).to.exist;
+
+            // Verify chat msg survived (backend msgs are filtered out by prepareForStorage)
+            const restoredChat = restored.context._msgs.find(m =>
+                m.msg.content === 'I want to book a hotel');
+            expect(restoredChat).to.exist;
+
+            // Backend msg should not be in restored (filtered by prepareForStorage)
+            const restoredBackend = restored.context._msgs.find(m =>
+                m.msg.content && m.msg.content.includes('[BACKEND]'));
+            expect(restoredBackend).to.not.exist;
         });
     });
 });
