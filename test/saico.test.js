@@ -830,7 +830,7 @@ describe('Saico', function () {
         });
     });
 
-    describe('static rehydrate', () => {
+    describe('static restore', () => {
         it('should restore from backend with table name', async () => {
             const original = new Saico({ id: 'rh-id', name: 'rh-test', prompt: 'p' });
             original.activate({ createQ: true });
@@ -862,7 +862,7 @@ describe('Saico', function () {
             };
             Saico._backend = mockBackend;
 
-            const restored = await Saico.rehydrate('rh-id', { store: 'my-table' });
+            const restored = await Saico.restore('rh-id', { store: 'my-table' });
 
             expect(restored).to.be.instanceOf(Saico);
             expect(restored.id).to.equal('rh-id');
@@ -876,13 +876,13 @@ describe('Saico', function () {
         it('should return null when not found', async () => {
             const mockBackend = { get: sandbox.stub().resolves(undefined) };
             Saico._backend = mockBackend;
-            const result = await Saico.rehydrate('missing', { store: 'tbl' });
+            const result = await Saico.restore('missing', { store: 'tbl' });
             expect(result).to.be.null;
         });
 
         it('should throw when no backend registered', async () => {
             try {
-                await Saico.rehydrate('id', { store: 'tbl' });
+                await Saico.restore('id', { store: 'tbl' });
                 expect.fail('should have thrown');
             } catch (e) {
                 expect(e.message).to.include('No backend');
@@ -892,7 +892,7 @@ describe('Saico', function () {
         it('should throw when no table specified', async () => {
             Saico._backend = { get: sandbox.stub() };
             try {
-                await Saico.rehydrate('id');
+                await Saico.restore('id');
                 expect.fail('should have thrown');
             } catch (e) {
                 expect(e.message).to.include('No table');

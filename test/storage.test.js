@@ -103,7 +103,7 @@ describe('Storage Integration', function () {
         });
     });
 
-    describe('rehydrate restores from DynamoDB', () => {
+    describe('restore from DynamoDB', () => {
         it('should get by id and restore full Saico instance', async () => {
             Saico.registerBackend('dynamodb', { client: mockClient });
 
@@ -125,7 +125,7 @@ describe('Storage Integration', function () {
                 Item: marshall(prepared, { removeUndefinedValues: true, convertClassInstanceToMap: true }),
             });
 
-            const restored = await Saico.rehydrate('rh-456', { store: 'sessions' });
+            const restored = await Saico.restore('rh-456', { store: 'sessions' });
 
             expect(restored).to.be.instanceOf(Saico);
             expect(restored.id).to.equal('rh-456');
@@ -147,12 +147,12 @@ describe('Storage Integration', function () {
             Saico.registerBackend('dynamodb', { client: mockClient });
             mockClient.send.resolves({ Item: undefined });
 
-            const result = await Saico.rehydrate('missing', { store: 'sessions' });
+            const result = await Saico.restore('missing', { store: 'sessions' });
             expect(result).to.be.null;
         });
     });
 
-    describe('full round-trip: create → messages → close → rehydrate', () => {
+    describe('full round-trip: create → messages → close → restore', () => {
         it('should preserve state through DynamoDB save and restore', async () => {
             Saico.registerBackend('dynamodb', { client: mockClient });
 
@@ -191,7 +191,7 @@ describe('Storage Integration', function () {
             expect(savedItem).to.not.be.null;
 
             // Rehydrate — reads from DynamoDB
-            const restored = await Saico.rehydrate('round-trip-id', { store: 'sessions' });
+            const restored = await Saico.restore('round-trip-id', { store: 'sessions' });
 
             expect(restored.id).to.equal('round-trip-id');
             expect(restored.name).to.equal('round-trip');

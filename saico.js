@@ -501,19 +501,22 @@ class Saico {
     }
 
     /**
-     * Close the session — save state to registered backend, cancel task.
+     * Save instance state to registered backend under _storeName.
+     */
+    async store() {
+        if (!this._storeName) return;
+        const backend = Saico.getBackend();
+        if (!backend) return;
+        const data = await this.prepareForStorage();
+        await backend.put(data, this._storeName);
+    }
+
+    /**
+     * Close the session — cancel task. Call store() first if persistence needed.
      */
     async closeSession() {
         if (!this._task) return;
-
-        if (this._storeName && this.msgs) {
-            const backend = Saico.getBackend();
-            if (backend) {
-                const data = await this.prepareForStorage();
-                await backend.put(data, this._storeName);
-            }
-        }
-
+        await this.store();
         this._task._ecancel();
     }
 
@@ -718,7 +721,7 @@ class Saico {
      * @param {Object} opt - Options (store: table name, backend, functions, states, etc.)
      * @returns {Promise<Saico|null>}
      */
-    static async rehydrate(id, opt = {}) {
+    static async restore(id, opt = {}) {
         const backend = opt.backend || Saico.getBackend();
         if (!backend)
             throw new Error('No backend registered. Call Saico.registerBackend() first.');

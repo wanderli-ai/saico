@@ -72,7 +72,7 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - `_getDb()` searches up parent Saico chain when no local `_db`; falls back to `Saico._backend`; throws if none found
    - DB retrieval methods (`dbGetItem`, `dbQuery`, `dbGetAll`) call `_deserializeRecord()` hook
    - `opt.dynamodb = { region, credentials }` auto-creates DynamoDBAdapter; `opt.db` accepts any adapter; `Saico.registerBackend('dynamodb', config)` for library-level registration
-   - `opt.store` — table name string for instance persistence (used by `closeSession`/`rehydrate`)
+   - `opt.store` — table name string for instance persistence (used by `closeSession`/`restore`)
    - Child spawning: `spawn(child)` and `spawnAndRun(child)` — parent must be activated; child is auto-activated if needed
    - Msgs methods: `findMsgs()`, `findDeepestMsgs()`
    - `_findToolImpl(toolName)` — searches Saico hierarchy (up then down) for `TOOL_<name>` method
@@ -82,7 +82,7 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - **deactivate**: bubbles cleaned messages to parent Q, then closes msgs Q
    - User data: `userData`, `setUserData()`, `getUserData()`, `clearUserData()`
    - `this.id` — unique instance ID (not underscore-prefixed, persisted to Redis)
-   - Session info: `getSessionInfo()`, `closeSession()`, `static rehydrate()`, `sessionConfig`
+   - Session info: `getSessionInfo()`, `store()`, `closeSession()`, `static restore()`, `sessionConfig`
    - `prepareForStorage()` — creates clean snapshot: strips `_` props, skips functions/states, compresses msgs
    - Serialization: `async serialize()` calls `prepareForStorage()` then `JSON.stringify`; `static async Saico.deserialize()`
    - Static backend: `Saico.registerBackend(type, config)`, `Saico.getBackend()`, `Saico._backend`
@@ -109,7 +109,7 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
    - `_processSendMessage` uses `_preamble` and `_aggregatedFunctions` from opts when available
    - Standalone fallback uses own `this.functions` (no hierarchy traversal)
    - `prepareForStorage()` — filters/trims/compresses _msgs for durable persistence
-   - `initHistory()` — decompresses `_chat_history` into `_msgs` (called by `Saico.rehydrate`)
+   - `initHistory()` — decompresses `_chat_history` into `_msgs` (called by `Saico.restore`)
    - No task/store references — Msgs is a pure message queue
 
 5. **dynamo.js** - DynamoDB storage adapter (generalized from backend/aws.js)
@@ -144,8 +144,9 @@ Saico is a hierarchical AI conversation orchestrator library. The **Saico** mast
 - `new Saico(opt)` — creates instance with Redis proxy + DB access. No Itask yet. `opt.createQ` and `this.states` can be set here.
 - `instance.activate()` — creates internal Itask + optional message Q (uses `this.createQ` and `this.states` from class; defaults to wait state when no states defined)
 - `instance.deactivate()` — bubbles cleaned messages to parent, closes msgs Q, cancels task
-- `instance.closeSession()` — calls `prepareForStorage()`, saves to registered backend under `_storeName`, cancels task
-- `Saico.rehydrate(id, { store })` — loads from registered backend, decompresses msgs, returns restored Saico
+- `instance.store()` — calls `prepareForStorage()`, saves to registered backend under `_storeName`
+- `instance.closeSession()` — calls `store()`, then cancels task
+- `Saico.restore(id, { store })` — loads from registered backend, decompresses msgs, returns restored Saico
 - DB methods (`dbGetItem`, etc.) work before and after activation
 
 **Pluggable DB Backend**: The Saico class has generic DB methods that delegate to `_getDb()`:
@@ -325,11 +326,14 @@ session.getUserData('role');  // 'admin'
 // Session info
 session.getSessionInfo();  // { id, name, running, completed, messageCount, ... }
 
-// Close — prepareForStorage + save to registered backend under 'sessions' table, cancels task
+// Store — save to registered backend (can be called independently)
+await session.store();
+
+// Close — calls store() then cancels task
 await session.closeSession();
 
-// Rehydrate — restore from registered backend
-const restored = await Saico.rehydrate(session.id, { store: 'sessions' });
+// Restore from registered backend
+const restored = await Saico.restore(session.id, { store: 'sessions' });
 ```
 
 **Spawning Child Saico Instances**:
@@ -377,8 +381,9 @@ const json = await session.serialize();
 const restored = await Saico.deserialize(json);
 
 // Durable persistence (uses registered backend)
-await session.closeSession();  // prepareForStorage + save to backend under opt.store table
-const restored2 = await Saico.rehydrate(id, { store: 'sessions' });
+await session.store();         // save independently
+await session.closeSession();  // store + cancel task
+const restored2 = await Saico.restore(id, { store: 'sessions' });
 ```
 
 **DB deserialization hook**:
@@ -433,11 +438,11 @@ Search order: current Saico → walk UP parents → walk DOWN children (BFS). Fi
 ### Testing Framework
 
 Uses Mocha with Chai and Sinon for:
-- Saico class lifecycle, msgs Q ownership, spawn/spawnAndRun, DB delegation, subclass extension, Redis proxy, sendMessage orchestration, recvChatMessage routing, preamble building, opt.isolate, deactivate bubbling, userData, sessionConfig, async serialize/deserialize, prepareForStorage, registerBackend, closeSession/rehydrate via registered backend, DB deserialize hook, getSessionInfo (saico.test.js)
+- Saico class lifecycle, msgs Q ownership, spawn/spawnAndRun, DB delegation, subclass extension, Redis proxy, sendMessage orchestration, recvChatMessage routing, preamble building, opt.isolate, deactivate bubbling, userData, sessionConfig, async serialize/deserialize, prepareForStorage, registerBackend, closeSession/restore via registered backend, DB deserialize hook, getSessionInfo (saico.test.js)
 - DynamoDB adapter with mocked client (dynamo.test.js)
 - Pure task hierarchy, states, cancellation, wait/continue (itask.test.js)
 - Msgs class, tool calls, _createMsgQ with preamble support, prepareForStorage, initHistory, callback hooks (context.test.js)
 - Full hierarchy message flow, tool calls, serialization (integration.test.js)
-- Storage layer end-to-end: registerBackend, closeSession/rehydrate round-trip, db* API through registered backend (storage.test.js)
+- Storage layer end-to-end: registerBackend, closeSession/restore round-trip, db* API through registered backend (storage.test.js)
 
 Test files mock external dependencies (OpenAI API, token counting, DynamoDB client) for isolated unit testing. DB adapter tests inject a mock client via `opt.client`.

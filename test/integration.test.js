@@ -656,7 +656,7 @@ describe('Integration Tests', function () {
     });
 
     describe('Full Persistence Flow', () => {
-        it('should create session, send messages, close, and rehydrate', async () => {
+        it('should create session, send messages, close, and restore', async () => {
             const saved = {};
             const mockBackend = {
                 put: sinon.stub().callsFake((data, table) => { saved[data.id] = data; }),
@@ -696,8 +696,8 @@ describe('Integration Tests', function () {
             expect(data.id).to.equal('persist-id');
             expect(data.msgs.chat_history).to.be.a('string');
 
-            // Rehydrate — restore from registered backend
-            const restored = await Saico.rehydrate('persist-id', { store: 'sessions-table' });
+            // Restore from registered backend
+            const restored = await Saico.restore('persist-id', { store: 'sessions-table' });
             expect(restored.id).to.equal('persist-id');
             expect(restored.name).to.equal('persist-session');
             expect(restored.msgs).to.exist;

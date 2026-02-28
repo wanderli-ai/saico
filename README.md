@@ -1,4 +1,4 @@
-# Saico - Hierarchical AI Conversation Orchestrator
+# Saico - Simple AI-Agent Conversation Orchestrator
 
 Saico is a Node.js library for building AI agents with hierarchical conversations, automatic context aggregation, and enterprise-grade tool calling. It manages nested task trees where each node can have its own message queue, system prompt, tools, and state — and the library automatically assembles the full payload sent to the LLM by walking the tree.
 
@@ -210,7 +210,7 @@ new Saico({
     // Storage
     redis: true,               // Set false to skip Redis proxy
     key: 'custom-redis-key',
-    store: 'my-table',         // Table name for instance persistence (closeSession/rehydrate)
+    store: 'my-table',         // Table name for instance persistence (store/closeSession/restore)
     dynamodb: {                // DynamoDB config (creates instance-level adapter)
         region: 'us-east-1',
         credentials: { accessKeyId: '...', secretAccessKey: '...' },
@@ -258,10 +258,11 @@ agent.getSessionInfo();
 //   userData, uptime
 // }
 
-await agent.closeSession();  // prepareForStorage + save to registered backend, cancels task
+await agent.store();         // save to registered backend independently
+await agent.closeSession();  // store + cancel task
 
 // Restore from registered backend
-const restored = await Saico.rehydrate(agent.id, { store: 'sessions' });
+const restored = await Saico.restore(agent.id, { store: 'sessions' });
 ```
 
 ## Database Access
@@ -312,8 +313,9 @@ const json = await agent.serialize();
 const restored = await Saico.deserialize(json);
 
 // Durable persistence (uses registered backend + opt.store table name)
-await agent.closeSession();
-const restored2 = await Saico.rehydrate(agent.id, { store: 'sessions' });
+await agent.store();         // save independently
+await agent.closeSession();  // store + cancel task
+const restored2 = await Saico.restore(agent.id, { store: 'sessions' });
 ```
 
 `prepareForStorage()` automatically picks up all non-underscore properties (id, name, prompt, userData, sessionConfig, tm_create, isolate, etc.) and produces compressed chat_history for the msgs Q.
@@ -405,7 +407,7 @@ saico/
 npm test
 ```
 
-300 tests covering Saico lifecycle, msgs Q ownership, spawn/spawnAndRun, task hierarchy, message handling, tool calls, DB adapters, async serialization, prepareForStorage, backend registration, persistence (closeSession/rehydrate via registered backend), storage integration, and full hierarchy flows.
+300 tests covering Saico lifecycle, msgs Q ownership, spawn/spawnAndRun, task hierarchy, message handling, tool calls, DB adapters, async serialization, prepareForStorage, backend registration, persistence (store/closeSession/restore via registered backend), storage integration, and full hierarchy flows.
 
 ## Requirements
 
