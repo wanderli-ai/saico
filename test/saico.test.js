@@ -782,6 +782,30 @@ describe('Saico', function () {
         });
     });
 
+    describe('_genId', () => {
+        it('should generate random hex id when no opt.id', () => {
+            const s = new Saico({ name: 'test' });
+            expect(s.id).to.be.a('string');
+            expect(s.id).to.have.length(16);
+            expect(/^[0-9a-f]+$/.test(s.id)).to.be.true;
+        });
+
+        it('should use opt.id when provided', () => {
+            const s = new Saico({ id: 'explicit-id', name: 'test' });
+            expect(s.id).to.equal('explicit-id');
+        });
+
+        it('should be overridable in subclasses', () => {
+            class MyAgent extends Saico {
+                _genId() {
+                    return 'custom-' + this.name;
+                }
+            }
+            const s = new MyAgent({ name: 'agent' });
+            expect(s.id).to.equal('custom-agent');
+        });
+    });
+
     describe('closeSession', () => {
         it('should cancel task', async () => {
             const s = new Saico({ name: 'test' });
@@ -1320,27 +1344,27 @@ describe('Saico', function () {
 
         it('dbUpdate should delegate to backend.update', async () => {
             const s = new Saico({ db: fakeDb });
-            await s.dbUpdate('id', '1', 'status', 'active');
+            await s.dbUpdate('status', 'active', 'id', '1');
             expect(fakeDb.update.calledOnce).to.be.true;
-            expect(fakeDb.update.firstCall.args).to.deep.equal(['id', '1', 'status', 'active', undefined]);
+            expect(fakeDb.update.firstCall.args).to.deep.equal(['id', '1', 'status', 'active', null]);
         });
 
         it('dbUpdatePath should delegate to backend.updatePath', async () => {
             const s = new Saico({ db: fakeDb });
             const path = [{ key: 'items' }];
-            await s.dbUpdatePath('id', '1', path, 'name', 'val');
+            await s.dbUpdatePath(path, 'name', 'val', 'id', '1');
             expect(fakeDb.updatePath.calledOnce).to.be.true;
         });
 
         it('dbListAppend should delegate to backend.listAppend', async () => {
             const s = new Saico({ db: fakeDb });
-            await s.dbListAppend('id', '1', 'items', { name: 'new' });
+            await s.dbListAppend('items', { name: 'new' }, 'id', '1');
             expect(fakeDb.listAppend.calledOnce).to.be.true;
         });
 
         it('dbListAppendPath should delegate to backend.listAppendPath', async () => {
             const s = new Saico({ db: fakeDb });
-            await s.dbListAppendPath('id', '1', [], 'items', { name: 'new' });
+            await s.dbListAppendPath([], 'items', { name: 'new' }, 'id', '1');
             expect(fakeDb.listAppendPath.calledOnce).to.be.true;
         });
 
@@ -1361,7 +1385,7 @@ describe('Saico', function () {
             const s = new Saico({ db: fakeDb });
             await s.dbSetCounterValue('OrderId', 50);
             expect(fakeDb.setCounterValue.calledOnce).to.be.true;
-            expect(fakeDb.setCounterValue.firstCall.args).to.deep.equal(['OrderId', 50, undefined]);
+            expect(fakeDb.setCounterValue.firstCall.args).to.deep.equal(['OrderId', 50, null]);
         });
 
         it('dbCountItems should delegate to backend.countItems', async () => {

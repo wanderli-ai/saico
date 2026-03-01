@@ -267,20 +267,24 @@ const restored = await Saico.restore(agent.id, { store: 'sessions' });
 
 ## Database Access
 
-Saico provides backend-agnostic DB methods. Configure via `Saico.registerBackend('dynamodb', config)` (library-level), `opt.dynamodb` (instance-level auto-creates adapter), or `opt.db` (any adapter). Table name is required on every call. Child Saico instances without their own DB inherit the parent's adapter automatically via `_getDb()`, which also falls back to the registered backend.
+Saico provides backend-agnostic DB methods. Configure via `Saico.registerBackend('dynamodb', config)` (library-level), `opt.dynamodb` (instance-level auto-creates adapter), or `opt.db` (any adapter). Key, key value, and table default to `'id'`, `this.id`, and `this._storeName` — so operating on own record is a one-liner. Child Saico instances inherit the parent's adapter via `_getDb()`, which also falls back to the registered backend.
 
 ```js
-// CRUD — table name required on every call
+// CRUD — shorthand (defaults: key='id', value=this.id, table=this._storeName)
+const me = await agent.dbGetItem();                   // get own record
+await agent.dbDeleteItem();                           // delete own record
+// Explicit
 await agent.dbPutItem({ id: '123', name: 'test' }, 'my-table');
 const item = await agent.dbGetItem('id', '123', 'my-table');
 await agent.dbDeleteItem('id', '123', 'my-table');
 const items = await agent.dbQuery('email-index', 'email', 'user@test.com', 'my-table');
 const all = await agent.dbGetAll('my-table');
 
-// Updates
-await agent.dbUpdate('id', '123', 'status', 'active', 'my-table');
-await agent.dbUpdatePath('id', '123', [{ key: 'nested' }], 'field', 'value', 'my-table');
-await agent.dbListAppend('id', '123', 'tags', 'new-tag', 'my-table');
+// Updates — setKey, item first; key, keyValue, table last (with defaults)
+await agent.dbUpdate('status', 'active');             // update own record
+await agent.dbUpdate('status', 'active', 'id', '123', 'my-table');
+await agent.dbUpdatePath([{ key: 'nested' }], 'field', 'value');
+await agent.dbListAppend('tags', 'new-tag');
 
 // Counters
 const nextId = await agent.dbNextCounterId('OrderId', 'counters');

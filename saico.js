@@ -38,7 +38,8 @@ class Saico {
      * @param {boolean} [opt.redis=true] - Set false to skip Redis proxy
      * @param {boolean} [opt.createQ] - Create message Q on activate()
      * @param {boolean} [opt.isolate] - Isolate: don't aggregate from ancestors
-     * @param {Object} [opt.dynamodb] - DynamoDB config { region, credentials: { accessKeyId, secretAccessKey }, client }
+     * @param {Object} [opt.dynamodb] - DynamoDB config { region, credentials: { accessKeyId, secretAccessKey },
+     *   client }
      * @param {Object} [opt.db] - Pluggable DB backend
      * @param {string} [opt.store] - Table name for instance persistence
      * @param {Object} [opt.userData] - Initial user data
@@ -46,7 +47,8 @@ class Saico {
      */
     constructor(opt = {}) {
         // Internal properties (underscore-prefixed, not persisted to Redis)
-        this.id = opt.id || crypto.randomBytes(8).toString('hex');
+        this.name = opt.name || this.constructor.name || 'saico';
+        this.id = opt.id || this._genId();
         this._task = null;
         this._storeName = (typeof opt.store === 'string') ? opt.store : null;
         this._opt = opt;
@@ -57,7 +59,6 @@ class Saico {
         this.msgs_id = null;
 
         // Public configuration
-        this.name = opt.name || this.constructor.name || 'saico';
         this.prompt = opt.prompt || '';
         this.functions = opt.functions || null;
         this.createQ = opt.createQ || false;
@@ -501,6 +502,14 @@ class Saico {
     }
 
     /**
+     * Generate an id. Called by constructor when opt.id is not provided.
+     * Overridable by subclasses for custom ID schemes.
+     */
+    _genId() {
+        return crypto.randomBytes(8).toString('hex');
+    }
+
+    /**
      * Save instance state to registered backend under _storeName.
      */
     async store() {
@@ -537,23 +546,23 @@ class Saico {
         throw new Error('No DB backend configured. Call Saico.registerBackend() or set opt.db.');
     }
 
-    async dbPutItem(item, table) {
+    async dbPutItem(item, table = this._storeName) {
         const db = this._getDb();
         return db.put(item, table);
     }
 
-    async dbGetItem(key, value, table) {
+    async dbGetItem(key = 'id', value = this.id, table = this._storeName) {
         const db = this._getDb();
         const result = await db.get(key, value, table);
         return result ? this._deserializeRecord(result) : result;
     }
 
-    async dbDeleteItem(key, value, table) {
+    async dbDeleteItem(key = 'id', value = this.id, table = this._storeName) {
         const db = this._getDb();
         return db.delete(key, value, table);
     }
 
-    async dbQuery(index, key, value, table) {
+    async dbQuery(index, key, value, table = this._storeName) {
         const db = this._getDb();
         const results = await db.query(index, key, value, table);
         return Array.isArray(results)
@@ -561,7 +570,7 @@ class Saico {
             : results;
     }
 
-    async dbGetAll(table) {
+    async dbGetAll(table = this._storeName) {
         const db = this._getDb();
         const results = await db.getAll(table);
         return Array.isArray(results)
@@ -569,42 +578,42 @@ class Saico {
             : results;
     }
 
-    async dbUpdate(key, keyValue, setKey, item, table) {
+    async dbUpdate(setKey, item, key = 'id', keyValue = this.id, table = this._storeName) {
         const db = this._getDb();
         return db.update(key, keyValue, setKey, item, table);
     }
 
-    async dbUpdatePath(key, keyValue, path, setKey, item, table) {
+    async dbUpdatePath(path, setKey, item, key = 'id', keyValue = this.id, table = this._storeName) {
         const db = this._getDb();
         return db.updatePath(key, keyValue, path, setKey, item, table);
     }
 
-    async dbListAppend(key, keyValue, setKey, item, table) {
+    async dbListAppend(setKey, item, key = 'id', keyValue = this.id, table = this._storeName) {
         const db = this._getDb();
         return db.listAppend(key, keyValue, setKey, item, table);
     }
 
-    async dbListAppendPath(key, keyValue, path, setKey, item, table) {
+    async dbListAppendPath(path, setKey, item, key = 'id', keyValue = this.id, table = this._storeName) {
         const db = this._getDb();
         return db.listAppendPath(key, keyValue, path, setKey, item, table);
     }
 
-    async dbNextCounterId(counter, table) {
+    async dbNextCounterId(counter, table = this._storeName) {
         const db = this._getDb();
         return db.nextCounterId(counter, table);
     }
 
-    async dbGetCounterValue(counter, table) {
+    async dbGetCounterValue(counter, table = this._storeName) {
         const db = this._getDb();
         return db.getCounterValue(counter, table);
     }
 
-    async dbSetCounterValue(counter, value, table) {
+    async dbSetCounterValue(counter, value, table = this._storeName) {
         const db = this._getDb();
         return db.setCounterValue(counter, value, table);
     }
 
-    async dbCountItems(table) {
+    async dbCountItems(table = this._storeName) {
         const db = this._getDb();
         return db.countItems(table);
     }

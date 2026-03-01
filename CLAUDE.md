@@ -269,19 +269,23 @@ await agent.start();
 const reply = await agent.recvChatMessage('Hello!');
 ```
 
-**Saico DB methods** (backend-agnostic, table required on every call):
+**Saico DB methods** (backend-agnostic, key/table default to 'id'/this.id/this._storeName):
 ```javascript
-// CRUD
+// CRUD — shorthand (defaults: key='id', value=this.id, table=this._storeName)
+const me = await this.dbGetItem();                    // get own record
+await this.dbDeleteItem();                            // delete own record
+// Explicit
 await this.dbPutItem({ id: '123', name: 'test' }, 'my-table');
 const item = await this.dbGetItem('id', '123', 'my-table');  // calls _deserializeRecord()
 await this.dbDeleteItem('id', '123', 'my-table');
-const items = await this.dbQuery('email-index', 'email', 'user@test.com', 'my-table');  // calls _deserializeRecord()
-const all = await this.dbGetAll('my-table');  // calls _deserializeRecord()
+const items = await this.dbQuery('email-index', 'email', 'user@test.com', 'my-table');
+const all = await this.dbGetAll('my-table');
 
-// Updates
-await this.dbUpdate('id', '123', 'status', 'active', 'my-table');
-await this.dbUpdatePath('id', '123', [{key: 'nested'}], 'field', 'value', 'my-table');
-await this.dbListAppend('id', '123', 'tags', 'new-tag', 'my-table');
+// Updates — setKey, item first; key, keyValue, table last (with defaults)
+await this.dbUpdate('status', 'active');              // update own record
+await this.dbUpdate('status', 'active', 'id', '123', 'my-table');
+await this.dbUpdatePath([{key: 'nested'}], 'field', 'value');
+await this.dbListAppend('tags', 'new-tag');
 
 // Counters
 const nextId = await this.dbNextCounterId('OrderId', 'counters');
